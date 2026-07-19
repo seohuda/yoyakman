@@ -152,12 +152,12 @@ async def on_ready():
 async def summarize_command(ctx: commands.Context):
     if ctx.message.reference is None:
         await ctx.reply(
-            "⚠️ **어디서부터 요약할지 알려주세요!**\n"
+            "**어디서부터 요약할지 알려주세요!**\n"
             "요약을 시작할 메시지에 **답장(Reply)** 을 걸고 `!요약`을 입력하면, 그 메시지 이후의 대화를 요약해드려요."
         )
         return
 
-    processing_msg = await ctx.reply("⏳ 채팅을 수집해서 요약하고 있어요. 잠시만 기다려주세요...")
+    processing_msg = await ctx.reply("채팅을 수집해서 요약하고 있어요. 잠시만 기다려주세요...")
 
     try:
         start_message_id = ctx.message.reference.message_id
@@ -171,14 +171,14 @@ async def summarize_command(ctx: commands.Context):
         )
 
         if not collected:
-            await processing_msg.edit(content="📭 기준 메시지 이후에 요약할 대화가 없어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
+            await processing_msg.edit(content="기준 메시지 이후에 요약할 대화가 없어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
             return
 
         chat_text = "\n".join(collected)
         summary = await asyncio.wait_for(summarize_with_ai(chat_text), timeout=90)
 
         header = (
-            f"🗂️ **채팅 요약** · 메시지 **{len(collected)}개** 분석\n"
+            f"**채팅 요약** · 메시지 **{len(collected)}개** 분석\n"
             f"{'─' * 30}\n"
         )
         first, *rest = split_for_discord(header + summary)
@@ -187,28 +187,28 @@ async def summarize_command(ctx: commands.Context):
             await ctx.send(chunk)
 
     except asyncio.TimeoutError:
-        await processing_msg.edit(content="⌛ 요약 생성이 너무 오래 걸려 중단했어요. 잠시 후 다시 시도해주세요.")
+        await processing_msg.edit(content="요약 생성이 너무 오래 걸려 중단했어요. 잠시 후 다시 시도해주세요.")
     except discord.NotFound:
-        await processing_msg.edit(content="❌ 답장한 메시지를 찾을 수 없어요. 삭제된 메시지일 수 있으니 다른 메시지에 답장해서 다시 시도해주세요.")
+        await processing_msg.edit(content="답장한 메시지를 찾을 수 없어요. 삭제된 메시지일 수 있으니 다른 메시지에 답장해서 다시 시도해주세요.")
     except discord.Forbidden:
-        await processing_msg.edit(content="❌ 봇에게 이 채널의 메시지를 읽을 권한이 없어요. 서버 관리자에게 권한 설정을 요청해주세요.")
+        await processing_msg.edit(content="봇에게 이 채널의 메시지를 읽을 권한이 없어요. 서버 관리자에게 권한 설정을 요청해주세요.")
     except Exception as e:
         print(f"[ERROR] !요약 처리 중 오류: {e}")
-        await processing_msg.edit(content="❌ 요약 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.")
+        await processing_msg.edit(content="요약 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.")
 
 
 @summarize_command.error
 async def summarize_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
-        await ctx.reply(f"🚦 **잠시 쉬어가는 중이에요!** {error.retry_after:.0f}초 후에 다시 사용할 수 있어요. (1분에 최대 3회)")
+        await ctx.reply(f"**잠시 쉬어가는 중이에요!** {error.retry_after:.0f}초 후에 다시 사용할 수 있어요. (1분에 최대 3회)")
 
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        print("❌ .env 파일에 DISCORD_TOKEN이 없습니다!")
+        print(".env 파일에 DISCORD_TOKEN이 없습니다!")
         exit(1)
     if not GEMINI_API_KEY:
-        print("❌ .env 파일에 GEMINI_API_KEY가 없습니다!")
+        print(".env 파일에 GEMINI_API_KEY가 없습니다!")
         exit(1)
 
     bot.run(DISCORD_TOKEN)
