@@ -1,9 +1,7 @@
 import os
-import json
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from datetime import date
 
 import google.generativeai as genai
 
@@ -15,26 +13,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
-DAILY_LIMIT_TOTAL = 20
-DAILY_LIMIT_USER = 2
-USAGE_FILE = "usage.json"
 
-
-def load_usage() -> dict:
-    today = str(date.today())
-    try:
-        with open(USAGE_FILE, "r") as f:
-            data = json.load(f)
-        if data.get("date") != today:
-            return {"date": today, "total": 0, "users": {}}
-        return data
-    except:
-        return {"date": today, "total": 0, "users": {}}
-
-
-def save_usage(data: dict):
-    with open(USAGE_FILE, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 async def summarize_with_ai(chat_text: str) -> str:
@@ -90,10 +69,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    usage = load_usage()
     print(f"봇 로그인 완료: {bot.user} (ID: {bot.user.id})")
     print(f"연결된 서버 수: {len(bot.guilds)}개")
-    print(f"오늘 전체 남은 횟수: {DAILY_LIMIT_TOTAL - usage['total']}/{DAILY_LIMIT_TOTAL}")
     print("사용법: 요약할 메시지에 답장 → !요약 입력")
 
 
@@ -108,24 +85,7 @@ async def summarize_command(ctx: commands.Context):
         )
         return
 
-    usage = load_usage()
-    user_count = usage["users"].get(user_id, 0)
-    total_count = usage["total"]
-
-    if total_count >= DAILY_LIMIT_TOTAL:
-        await ctx.reply(
-            f"❌ **오늘 전체 요약 횟수를 모두 사용했습니다! (0/{DAILY_LIMIT_TOTAL})**\n"
-            "내일 자정에 초기화됩니다. "
-        )
-        return
-
-    if user_count >= DAILY_LIMIT_USER:
-        remaining_total = DAILY_LIMIT_TOTAL - total_count
-        await ctx.reply(
-            f"❌ **{ctx.author.display_name}님은 오늘 요약을 모두 사용했습니다! (0/{DAILY_LIMIT_USER})**\n"
-            f"전체 잔여 횟수: {remaining_total}/{DAILY_LIMIT_TOTAL} | 내일 자정에 초기화됩니다. "
-        )
-        return
+    # 사용 제한 없음
 
     processing_msg = await ctx.reply("⏳ 채팅을 수집하고 요약 중입니다...")
 
@@ -147,17 +107,8 @@ async def summarize_command(ctx: commands.Context):
         chat_text = "\n".join(collected)
         summary = await summarize_with_ai(chat_text)
 
-        usage["total"] += 1
-        usage["users"][user_id] = user_count + 1
-        save_usage(usage)
-
-        remaining_total = DAILY_LIMIT_TOTAL - usage["total"]
-        remaining_user = DAILY_LIMIT_USER - usage["users"][user_id]
-
         header = (
             f"🗂️ **채팅 요약 결과** | 수집된 메시지: **{len(collected)}개**\n"
-            f"🔋 전체 남은 횟수: **{remaining_total}/{DAILY_LIMIT_TOTAL}** "
-            f"| {ctx.author.display_name}님 남은 횟수: **{remaining_user}/{DAILY_LIMIT_USER}**\n"
             f"{'─' * 40}\n"
         )
         await processing_msg.edit(content=header + summary)
