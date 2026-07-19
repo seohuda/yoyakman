@@ -38,27 +38,31 @@ def save_usage(data: dict):
 
 
 async def summarize_with_ai(chat_text: str) -> str:
-    prompt = f"""당신은 대화 내용을 자연스럽게 요약해주는 센스 있는 사람입니다.
-주어진 채팅 내용을 읽고 전체적인 문맥과 흐름을 파악하여, 마치 실제 사람이 채팅방을 훑어보고 중요한 내용을 알려주는 것처럼 요약해주세요. 기계적인 말투나 AI가 작성했다는 느낌(예: '요약해 드리겠습니다', '이 대화는~')이 전혀 들지 않게 평범하고 자연스러운 문장으로 작성해야 합니다. 앞뒤 상황을 잘 유추해서 흐름이 끊기지 않게 해주세요.
+    prompt = f"""[SYSTEM]
+Role: Advanced Chat Summarizer
+Goal: Parse the chat log, analyze context, and provide a highly accurate, structured summary.
+Constraints:
+- Maintain a factual, concise tone. Do not use AI-like conversational filler (e.g., "요약해 드리겠습니다").
+- Output MUST perfectly match the specified template.
+- Identify the core context and omit irrelevant small talk.
 
-[요약 지침]
-- 전체적인 대화의 맥락과 분위기, 뉘앙스를 잘 파악해서 반영할 것.
-- 핵심 요약은 중요한 주제, 사건, 결론 위주로 2~4줄로 작성하되, 관련된 사람들의 닉네임을 문장에 자연스럽게 녹여낼 것.
-- 키워드는 대화의 핵심을 짚어주는 단어로 3~4개만 해시태그 형식으로 적을 것.
-- 사용자별 요약은 각 사람이 대화에서 어떤 역할을 했거나 어떤 핵심 발언을 했는지 1줄로 자연스럽게 정리할 것 (비중이 적은 사람은 제외해도 무방).
+[RULES]
+1. Core Summary (📌 전체적인 흐름 요약): 2~4 sentences. Seamlessly integrate the nicknames of key participants.
+2. Keywords (🧩 핵심 키워드): Extract exactly 3~4 keywords, formatted as hashtags.
+3. User Summary (💬 누가 무슨 말을 했을까?): 1 sentence per significant participant. Omit lurkers or irrelevant messages.
 
-[출력 형식]
+[TEMPLATE]
 📌 전체적인 흐름 요약
-- (문맥이 이어지는 자연스러운 문장의 요약 내용)
+- (Contextual summary here)
 
 🧩 핵심 키워드
-#키워드1 #키워드2 #키워드3
+#Keyword1 #Keyword2 #Keyword3
 
 💬 누가 무슨 말을 했을까?
-- 닉네임: (자연스러운 1줄 요약)
-- 닉네임: (자연스러운 1줄 요약)
+- Nickname: (Action/Statement)
+- Nickname: (Action/Statement)
 
-[대화 내용]
+[INPUT_CHAT_LOG]
 {chat_text}"""
 
     response = await gemini_model.generate_content_async(prompt)
