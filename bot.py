@@ -147,7 +147,7 @@ def split_for_discord(text: str, limit: int = 2000) -> list[str]:
     return chunks
 
 
-async def respond_with_summary(interaction: discord.Interaction, collected: list[str]):
+async def respond_with_summary(interaction: discord.Interaction, collected: list[str], notice: str = ""):
     if not collected:
         await interaction.followup.send("요약할 대화가 없어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
         return
@@ -158,6 +158,7 @@ async def respond_with_summary(interaction: discord.Interaction, collected: list
 
         header = (
             f"**채팅 요약** · 메시지 **{len(collected)}개** 분석\n"
+            f"{notice}"
             f"{'─' * 30}\n"
         )
         for chunk in split_for_discord(header + summary):
@@ -189,40 +190,45 @@ async def on_ready():
     print("사용법: /요약 또는 메시지 우클릭 → 앱 → 이 메시지부터 요약")
 
 
-@bot.tree.command(name="요약", description="이 채널의 최근 대화를 요약해요")
-@app_commands.describe(개수="요약할 최근 메시지 개수 (기본 50, 최대 100)")
+@bot.tree.command(name="요약", description="이 채널의 최근 대화를 최대 100개까지 요약해요")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.checks.cooldown(3, 60)
-async def summarize_recent(
-    interaction: discord.Interaction,
-    개수: app_commands.Range[int, 5, 100] = 50,
-):
+async def summarize_recent(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
     try:
-        collected = await collect_recent(interaction.channel, count=개수)
-    except discord.Forbidden:
-        await interaction.followup.send("봇에게 이 채널의 메시지를 읽을 권한이 없어요. 서버 관리자에게 권한 설정을 요청해주세요.")
+        collected = await collect_recent(interaction.channel, count=100)
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send(
+            "이 채널의 대화 기록을 읽을 수 없어요.\n"
+            "봇이 초대되지 않은 서버에서는 메시지 우클릭 → 앱 → **이 메시지부터 요약**으로 선택한 메시지만 요약할 수 있어요."
+        )
         return
 
     await respond_with_summary(interaction, collected)
 
 
 @bot.tree.context_menu(name="이 메시지부터 요약")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.checks.cooldown(3, 60)
 async def summarize_from_message(interaction: discord.Interaction, message: discord.Message):
     await interaction.response.defer(thinking=True)
 
+    notice = ""
     try:
         collected = await collect_from_message(
             channel=interaction.channel,
             start_message=message,
             limit=100,
         )
-    except discord.Forbidden:
-        await interaction.followup.send("봇에게 이 채널의 메시지를 읽을 권한이 없어요. 서버 관리자에게 권한 설정을 요청해주세요.")
-        return
+    except (discord.Forbidden, discord.HTTPException):
+        formatted = format_message(message)
+        collected = [formatted] if formatted else []
+        notice = "-# 봇이 없는 곳이라 채널 기록을 읽을 수 없어, 선택한 메시지만 요약했어요.\n"
 
-    await respond_with_summary(interaction, collected)
+    await respond_with_summary(interaction, collected, notice=notice)
 
 
 @bot.tree.error
