@@ -75,6 +75,7 @@ async def on_ready():
 
 
 @bot.command(name="요약")
+@commands.cooldown(3, 60, commands.BucketType.user)
 async def summarize_command(ctx: commands.Context):
     user_id = str(ctx.author.id)
 
@@ -120,6 +121,12 @@ async def summarize_command(ctx: commands.Context):
     except Exception as e:
         print(f"[ERROR] !요약 처리 중 오류: {e}")
         await processing_msg.edit(content=f"❌ 요약 중 오류가 발생했습니다.\n```{str(e)}```")
+
+
+@summarize_command.error
+async def summarize_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.reply(f"⏳ **명령어 사용이 제한되었습니다!** {error.retry_after:.1f}초 후에 다시 시도해주세요. (1분당 최대 3회 제한)")
 
 
 if __name__ == "__main__":
