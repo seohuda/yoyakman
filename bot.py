@@ -2,6 +2,7 @@ import asyncio
 import os
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -20,8 +21,6 @@ gemini_model = genai.GenerativeModel(
         top_p=0.9,
     ),
 )
-
-
 
 
 async def summarize_with_ai(chat_text: str) -> str:
@@ -51,21 +50,21 @@ Goal: 채팅 로그를 정밀하게 분석해, 읽지 않은 사람도 대화의
 [STYLE RULES]
 - 출력 언어: 한국어. 문체는 "~했음", "~하는 중" 같은 간결한 개조식 또는 짧은 평서문.
 - "요약해 드리겠습니다" 같은 AI 인사말·설명·마무리 멘트를 절대 붙이지 않는다.
-- 출력은 아래 [TEMPLATE] 구조를 정확히 따른다. 템플릿 외의 섹션을 추가하지 않는다.
+- 출력은 아래 [TEMPLATE] 구조를 정확히 따른다. 템플릿 외의 섹션이나 이모지를 추가하지 않는다.
 
 [SECTION RULES]
-1. 📌 전체적인 흐름 요약: 2~4문장. 대화의 시작 → 전개 → 결론(있다면) 순서로, 핵심 참여자 닉네임을 자연스럽게 녹여서 서술.
-2. 🧩 핵심 키워드: 대화의 실제 주제를 나타내는 구체적인 명사 3~4개를 해시태그로. "#대화", "#채팅" 같은 무의미한 키워드 금지.
-3. 💬 누가 무슨 말을 했을까?: 유의미한 발언을 한 참여자만, 발언량이 많은 순서로 1인당 1문장. 한두 마디만 한 사람이나 리액션만 한 사람은 생략. 여러 명이 같은 의견이면 "A, B: ~에 동의했음"처럼 한 줄로 묶는다.
+1. 전체적인 흐름 요약: 2~4문장. 대화의 시작 → 전개 → 결론(있다면) 순서로, 핵심 참여자 닉네임을 자연스럽게 녹여서 서술.
+2. 핵심 키워드: 대화의 실제 주제를 나타내는 구체적인 명사 3~4개를 해시태그로. "#대화", "#채팅" 같은 무의미한 키워드 금지.
+3. 누가 무슨 말을 했을까?: 유의미한 발언을 한 참여자만, 발언량이 많은 순서로 1인당 1문장. 한두 마디만 한 사람이나 리액션만 한 사람은 생략. 여러 명이 같은 의견이면 "A, B: ~에 동의했음"처럼 한 줄로 묶는다.
 
 [TEMPLATE]
-📌 전체적인 흐름 요약
+**전체적인 흐름 요약**
 - (요약 내용)
 
-🧩 핵심 키워드
+**핵심 키워드**
 #키워드1 #키워드2 #키워드3
 
-💬 누가 무슨 말을 했을까?
+**누가 무슨 말을 했을까?**
 - 닉네임: (발언/행동 요약)
 - 닉네임: (발언/행동 요약)
 
@@ -100,10 +99,9 @@ def format_message(msg: discord.Message) -> str | None:
     return f"{msg.author.display_name}{reply_to}: {' '.join(parts)}"
 
 
-async def collect_messages(
-    channel: discord.TextChannel,
+async def collect_from_message(
+    channel: discord.abc.Messageable,
     start_message: discord.Message,
-    exclude_message_id: int,
     limit: int = 100,
 ) -> list[str]:
     messages = []
@@ -114,11 +112,26 @@ async def collect_messages(
             messages.append(formatted)
 
     async for msg in channel.history(after=start_message, limit=limit, oldest_first=True):
-        if msg.author.bot or msg.id == exclude_message_id:
+        if msg.author.bot:
             continue
         formatted = format_message(msg)
         if formatted:
             messages.append(formatted)
+    return messages
+
+
+async def collect_recent(
+    channel: discord.abc.Messageable,
+    count: int,
+) -> list[str]:
+    messages = []
+    async for msg in channel.history(limit=count):
+        if msg.author.bot:
+            continue
+        formatted = format_message(msg)
+        if formatted:
+            messages.append(formatted)
+    messages.reverse()
     return messages
 
 
@@ -134,46 +147,12 @@ def split_for_discord(text: str, limit: int = 2000) -> list[str]:
     return chunks
 
 
-intents = discord.Intents.default()
-intents.message_content = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-
-@bot.event
-async def on_ready():
-    print(f"봇 로그인 완료: {bot.user} (ID: {bot.user.id})")
-    print(f"연결된 서버 수: {len(bot.guilds)}개")
-    print("사용법: 요약할 메시지에 답장 → !요약 입력")
-
-
-@bot.command(name="요약")
-@commands.cooldown(3, 60, commands.BucketType.user)
-async def summarize_command(ctx: commands.Context):
-    if ctx.message.reference is None:
-        await ctx.reply(
-            "**어디서부터 요약할지 알려주세요!**\n"
-            "요약을 시작할 메시지에 **답장(Reply)** 을 걸고 `!요약`을 입력하면, 그 메시지 이후의 대화를 요약해드려요."
-        )
+async def respond_with_summary(interaction: discord.Interaction, collected: list[str]):
+    if not collected:
+        await interaction.followup.send("요약할 대화가 없어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
         return
 
-    processing_msg = await ctx.reply("채팅을 수집해서 요약하고 있어요. 잠시만 기다려주세요...")
-
     try:
-        start_message_id = ctx.message.reference.message_id
-        start_message = await ctx.channel.fetch_message(start_message_id)
-
-        collected = await collect_messages(
-            channel=ctx.channel,
-            start_message=start_message,
-            exclude_message_id=ctx.message.id,
-            limit=100,
-        )
-
-        if not collected:
-            await processing_msg.edit(content="기준 메시지 이후에 요약할 대화가 없어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
-            return
-
         chat_text = "\n".join(collected)
         summary = await asyncio.wait_for(summarize_with_ai(chat_text), timeout=90)
 
@@ -181,26 +160,82 @@ async def summarize_command(ctx: commands.Context):
             f"**채팅 요약** · 메시지 **{len(collected)}개** 분석\n"
             f"{'─' * 30}\n"
         )
-        first, *rest = split_for_discord(header + summary)
-        await processing_msg.edit(content=first)
-        for chunk in rest:
-            await ctx.send(chunk)
+        for chunk in split_for_discord(header + summary):
+            await interaction.followup.send(chunk)
 
     except asyncio.TimeoutError:
-        await processing_msg.edit(content="요약 생성이 너무 오래 걸려 중단했어요. 잠시 후 다시 시도해주세요.")
-    except discord.NotFound:
-        await processing_msg.edit(content="답장한 메시지를 찾을 수 없어요. 삭제된 메시지일 수 있으니 다른 메시지에 답장해서 다시 시도해주세요.")
-    except discord.Forbidden:
-        await processing_msg.edit(content="봇에게 이 채널의 메시지를 읽을 권한이 없어요. 서버 관리자에게 권한 설정을 요청해주세요.")
+        await interaction.followup.send("요약 생성이 너무 오래 걸려 중단했어요. 잠시 후 다시 시도해주세요.")
     except Exception as e:
-        print(f"[ERROR] !요약 처리 중 오류: {e}")
-        await processing_msg.edit(content="요약 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.")
+        print(f"[ERROR] 요약 처리 중 오류: {e}")
+        await interaction.followup.send("요약 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.")
 
 
-@summarize_command.error
-async def summarize_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        await ctx.reply(f"**잠시 쉬어가는 중이에요!** {error.retry_after:.0f}초 후에 다시 사용할 수 있어요. (1분에 최대 3회)")
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+@bot.event
+async def setup_hook():
+    synced = await bot.tree.sync()
+    print(f"슬래시 커맨드 동기화 완료: {len(synced)}개")
+
+
+@bot.event
+async def on_ready():
+    print(f"봇 로그인 완료: {bot.user} (ID: {bot.user.id})")
+    print(f"연결된 서버 수: {len(bot.guilds)}개")
+    print("사용법: /요약 또는 메시지 우클릭 → 앱 → 이 메시지부터 요약")
+
+
+@bot.tree.command(name="요약", description="이 채널의 최근 대화를 요약해요")
+@app_commands.describe(개수="요약할 최근 메시지 개수 (기본 50, 최대 100)")
+@app_commands.checks.cooldown(3, 60)
+async def summarize_recent(
+    interaction: discord.Interaction,
+    개수: app_commands.Range[int, 5, 100] = 50,
+):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        collected = await collect_recent(interaction.channel, count=개수)
+    except discord.Forbidden:
+        await interaction.followup.send("봇에게 이 채널의 메시지를 읽을 권한이 없어요. 서버 관리자에게 권한 설정을 요청해주세요.")
+        return
+
+    await respond_with_summary(interaction, collected)
+
+
+@bot.tree.context_menu(name="이 메시지부터 요약")
+@app_commands.checks.cooldown(3, 60)
+async def summarize_from_message(interaction: discord.Interaction, message: discord.Message):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        collected = await collect_from_message(
+            channel=interaction.channel,
+            start_message=message,
+            limit=100,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("봇에게 이 채널의 메시지를 읽을 권한이 없어요. 서버 관리자에게 권한 설정을 요청해주세요.")
+        return
+
+    await respond_with_summary(interaction, collected)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(
+            f"**잠시 쉬어가는 중이에요!** {error.retry_after:.0f}초 후에 다시 사용할 수 있어요. (1분에 최대 3회)",
+            ephemeral=True,
+        )
+        return
+    print(f"[ERROR] 커맨드 처리 중 오류: {error}")
+    if not interaction.response.is_done():
+        await interaction.response.send_message("문제가 발생했어요. 잠시 후 다시 시도해주세요.", ephemeral=True)
 
 
 if __name__ == "__main__":

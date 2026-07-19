@@ -1,6 +1,6 @@
 # Discord 채팅 요약 봇
 
-요약을 시작할 메시지에 답장으로 `!요약`을 입력하면, 해당 메시지 이후 대화를 Google Gemini가 요약해줍니다.
+`/요약` 슬래시 커맨드 또는 메시지 우클릭 메뉴로 채널 대화를 Google Gemini가 요약해줍니다.
 
 ## 사전 준비
 
@@ -11,7 +11,7 @@
 
 **봇 서버 초대**
 1. OAuth2 → URL Generator 탭
-2. Scopes: `bot` / Bot Permissions: `Read Messages`, `Send Messages`, `Read Message History`
+2. Scopes: `bot`, `applications.commands` / Bot Permissions: `Read Messages`, `Send Messages`, `Read Message History`
 3. 생성된 URL로 초대
 
 **Gemini API 키**
@@ -29,11 +29,15 @@ python bot.py
 
 ## 사용 방법
 
-1. 요약을 시작할 메시지에 **답장(Reply)** 선택
-2. `!요약` 입력 후 전송
-3. 봇이 해당 메시지부터 최대 100개의 채팅을 수집해 요약 반환
+**최근 대화 요약**
+- `/요약` 입력 (기본 최근 50개, `개수` 옵션으로 5~100개 조절)
+
+**특정 메시지부터 요약**
+- 요약을 시작할 메시지 **우클릭 → 앱 → 이 메시지부터 요약** (해당 메시지부터 최대 100개 수집)
 
 사용 제한: 1인당 분당 최대 3회
+
+> 봇을 새로 초대했거나 커맨드가 안 보이면, 봇 재시작 후 디스코드 클라이언트를 새로고침(Ctrl+R)하세요. 슬래시 커맨드 전역 등록에 최대 1시간 걸릴 수 있습니다.
 
 
 ## 다른 AI로 교체
