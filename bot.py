@@ -127,13 +127,16 @@ async def collect_from_message(
     limit: int = 100,
 ) -> list[str]:
     messages = []
+    remaining = limit
 
     if not start_message.author.bot:
         formatted = format_message(start_message)
         if formatted:
             messages.append(formatted)
+            # 시작 메시지도 100개 정원에 포함시킨다. 안 그러면 101개가 된다.
+            remaining -= 1
 
-    async for msg in channel.history(after=start_message, limit=limit, oldest_first=True):
+    async for msg in channel.history(after=start_message, limit=remaining, oldest_first=True):
         if msg.author.bot:
             continue
         formatted = format_message(msg)
@@ -165,7 +168,10 @@ def split_for_discord(text: str, limit: int = 2000) -> list[str]:
             cut = limit
         chunks.append(text[:cut])
         text = text[cut:].lstrip("\n")
-    chunks.append(text)
+    # 남은 조각이 비어 있을 수 있다(개행에서 잘린 뒤 lstrip으로 다 사라지는 경우).
+    # 빈 문자열을 보내면 디스코드가 400 Cannot send an empty message로 거절한다.
+    if text:
+        chunks.append(text)
     return chunks
 
 
@@ -187,7 +193,9 @@ async def reply(interaction: discord.Interaction, content: str, *, ephemeral: bo
 
 async def respond_with_summary(interaction: discord.Interaction, collected: list[str], notice: str = ""):
     if not collected:
-        await reply(interaction, "요약할 대화가 없어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
+        # notice에는 왜 이만큼밖에 못 읽었는지가 담겨 있다. 정작 아무것도
+        # 못 모은 이 경우에 그걸 빼면 "기다리면 된다"는 잘못된 안내가 된다.
+        await reply(interaction, f"{notice}요약할 대화를 찾지 못했어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
         return
 
     try:
@@ -301,9 +309,11 @@ async def summarize_from_message(interaction: discord.Interaction, message: disc
         # 봇이 초대되지 않은 서버 등 접근 자체가 막힌 경우에만 폴백한다.
         # 일시적 HTTP 오류는 그대로 올려보내 에러 핸들러가 안내하게 둔다.
         print(f"[INFO] 채널 기록 접근 불가, 선택 메시지만 요약: {e!r}")
-        formatted = format_message(message)
+        # 정상 경로와 동일하게 봇 메시지는 제외한다. 안 그러면 다른 봇이나
+        # 자기 자신의 이전 요약을 다시 요약하는 일이 생긴다.
+        formatted = format_message(message) if not message.author.bot else None
         collected = [formatted] if formatted else []
-        notice = "-# 봇이 없는 곳이라 채널 기록을 읽을 수 없어, 선택한 메시지만 요약했어요.\n"
+        notice = "-# 봇이 없는 곳이라 채널 기록을 읽을 수 없어, 선택한 메시지만 볼 수 있었어요.\n"
 
     await respond_with_summary(interaction, collected, notice=notice)
 
