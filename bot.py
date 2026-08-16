@@ -1,10 +1,10 @@
 import asyncio
 import math
 import os
+from collections.abc import AsyncIterator
 
 import discord
 from discord import app_commands
-from discord.ext import commands
 from dotenv import load_dotenv
 
 import google.generativeai as genai
@@ -13,6 +13,8 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+MAX_MESSAGES = 100
 
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel(
@@ -121,22 +123,10 @@ def format_message(msg: discord.Message) -> str | None:
     return f"{display_name_of(msg.author)}{reply_to}: {' '.join(parts)}"
 
 
-async def collect_from_message(
-    channel: discord.abc.Messageable,
-    start_message: discord.Message,
-    limit: int = 100,
-) -> list[str]:
+async def collect_formatted(history: AsyncIterator[discord.Message]) -> list[str]:
+    """히스토리에서 봇 메시지를 걸러내고 요약용 줄로 바꾼다."""
     messages = []
-    remaining = limit
-
-    if not start_message.author.bot:
-        formatted = format_message(start_message)
-        if formatted:
-            messages.append(formatted)
-            # 시작 메시지도 100개 정원에 포함시킨다. 안 그러면 101개가 된다.
-            remaining -= 1
-
-    async for msg in channel.history(after=start_message, limit=remaining, oldest_first=True):
+    async for msg in history:
         if msg.author.bot:
             continue
         formatted = format_message(msg)
@@ -145,18 +135,33 @@ async def collect_from_message(
     return messages
 
 
-async def collect_recent(
+async def collect_from_message(
     channel: discord.abc.Messageable,
-    count: int,
+    start_message: discord.Message,
+    limit: int = MAX_MESSAGES,
 ) -> list[str]:
     messages = []
-    async for msg in channel.history(limit=count):
-        if msg.author.bot:
-            continue
-        formatted = format_message(msg)
+    remaining = limit
+
+    if not start_message.author.bot:
+        formatted = format_message(start_message)
         if formatted:
             messages.append(formatted)
-    messages.reverse()
+            # 시작 메시지도 정원에 포함시킨다. 안 그러면 limit + 1개가 된다.
+            remaining -= 1
+
+    messages += await collect_formatted(
+        channel.history(after=start_message, limit=remaining, oldest_first=True)
+    )
+    return messages
+
+
+async def collect_recent(
+    channel: discord.abc.Messageable,
+    limit: int = MAX_MESSAGES,
+) -> list[str]:
+    messages = await collect_formatted(channel.history(limit=limit))
+    messages.reverse()  # history()는 최신순이므로 시간순으로 되돌린다
     return messages
 
 
@@ -220,12 +225,15 @@ async def respond_with_summary(interaction: discord.Interaction, collected: list
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(
-    command_prefix="!",
+# 접두사 커맨드는 더 이상 없다. commands.Bot을 쓰면 들어오는 모든 메시지를
+# 쓸데없이 접두사 파싱에 태우고, 남아 있던 "!"가 존재하지 않는 커맨드를
+# 광고하게 된다(!요약을 쳐도 아무 반응이 없었다).
+bot = discord.Client(
     intents=intents,
     # 요약문에 실린 어떤 문자열도 실제 멘션으로 발사되지 않게 한다.
     allowed_mentions=discord.AllowedMentions.none(),
 )
+tree = app_commands.CommandTree(bot)
 
 
 @bot.event
@@ -234,7 +242,7 @@ async def setup_hook():
     # 글로벌 동기화는 레이트 리밋 대상이라 재시작이 잦을 때 429가 나기 쉬운데,
     # 커맨드는 이미 등록돼 있으므로 동기화가 실패해도 봇은 떠 있어야 한다.
     try:
-        synced = await bot.tree.sync()
+        synced = await tree.sync()
         print(f"슬래시 커맨드 동기화 완료: {len(synced)}개")
     except discord.HTTPException as e:
         print(f"[WARN] 슬래시 커맨드 동기화 실패, 기존 등록분으로 계속 진행합니다: {e!r}")
@@ -256,7 +264,7 @@ COOLDOWN_PER = 60
 summary_cooldown = app_commands.checks.cooldown(COOLDOWN_RATE, COOLDOWN_PER)
 
 
-@bot.tree.command(name="요약", description="이 채널의 최근 대화를 최대 100개까지 요약해요")
+@tree.command(name="요약", description=f"이 채널의 최근 대화를 최대 {MAX_MESSAGES}개까지 요약해요")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @summary_cooldown
@@ -274,7 +282,7 @@ async def summarize_recent(interaction: discord.Interaction):
         return
 
     try:
-        collected = await collect_recent(channel, count=100)
+        collected = await collect_recent(channel, limit=MAX_MESSAGES)
     except (discord.Forbidden, discord.NotFound) as e:
         # 권한/접근 문제만 여기서 안내한다. 429나 5xx까지 잡아버리면
         # 일시적 장애를 '권한 없음'으로 잘못 알리고 원인도 못 남긴다.
@@ -289,7 +297,7 @@ async def summarize_recent(interaction: discord.Interaction):
     await respond_with_summary(interaction, collected)
 
 
-@bot.tree.context_menu(name="이 메시지부터 요약")
+@tree.context_menu(name="이 메시지부터 요약")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @summary_cooldown
@@ -303,7 +311,7 @@ async def summarize_from_message(interaction: discord.Interaction, message: disc
         collected = await collect_from_message(
             channel=message.channel,
             start_message=message,
-            limit=100,
+            limit=MAX_MESSAGES,
         )
     except (discord.Forbidden, discord.NotFound) as e:
         # 봇이 초대되지 않은 서버 등 접근 자체가 막힌 경우에만 폴백한다.
@@ -318,7 +326,7 @@ async def summarize_from_message(interaction: discord.Interaction, message: disc
     await respond_with_summary(interaction, collected, notice=notice)
 
 
-@bot.tree.error
+@tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CommandOnCooldown):
         await reply(
