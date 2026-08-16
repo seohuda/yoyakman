@@ -221,8 +221,14 @@ bot = commands.Bot(
 
 @bot.event
 async def setup_hook():
-    synced = await bot.tree.sync()
-    print(f"슬래시 커맨드 동기화 완료: {len(synced)}개")
+    # setup_hook에서 예외가 새어나가면 bot.run()이 그대로 죽는다.
+    # 글로벌 동기화는 레이트 리밋 대상이라 재시작이 잦을 때 429가 나기 쉬운데,
+    # 커맨드는 이미 등록돼 있으므로 동기화가 실패해도 봇은 떠 있어야 한다.
+    try:
+        synced = await bot.tree.sync()
+        print(f"슬래시 커맨드 동기화 완료: {len(synced)}개")
+    except discord.HTTPException as e:
+        print(f"[WARN] 슬래시 커맨드 동기화 실패, 기존 등록분으로 계속 진행합니다: {e!r}")
 
 
 @bot.event
@@ -251,7 +257,10 @@ async def summarize_recent(interaction: discord.Interaction):
 
     try:
         collected = await collect_recent(channel, count=100)
-    except (discord.Forbidden, discord.HTTPException):
+    except (discord.Forbidden, discord.NotFound) as e:
+        # 권한/접근 문제만 여기서 안내한다. 429나 5xx까지 잡아버리면
+        # 일시적 장애를 '권한 없음'으로 잘못 알리고 원인도 못 남긴다.
+        print(f"[INFO] 채널 기록 접근 불가: {e!r}")
         await reply(
             interaction,
             "이 채널의 대화 기록을 읽을 수 없어요.\n"
@@ -278,7 +287,10 @@ async def summarize_from_message(interaction: discord.Interaction, message: disc
             start_message=message,
             limit=100,
         )
-    except (discord.Forbidden, discord.HTTPException):
+    except (discord.Forbidden, discord.NotFound) as e:
+        # 봇이 초대되지 않은 서버 등 접근 자체가 막힌 경우에만 폴백한다.
+        # 일시적 HTTP 오류는 그대로 올려보내 에러 핸들러가 안내하게 둔다.
+        print(f"[INFO] 채널 기록 접근 불가, 선택 메시지만 요약: {e!r}")
         formatted = format_message(message)
         collected = [formatted] if formatted else []
         notice = "-# 봇이 없는 곳이라 채널 기록을 읽을 수 없어, 선택한 메시지만 요약했어요.\n"
