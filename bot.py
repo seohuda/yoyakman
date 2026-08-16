@@ -147,9 +147,25 @@ def split_for_discord(text: str, limit: int = 2000) -> list[str]:
     return chunks
 
 
+async def reply(interaction: discord.Interaction, content: str, *, ephemeral: bool = False) -> None:
+    """defer() 이후에도 반드시 사용자에게 응답이 닿게 한다.
+
+    두 커맨드 모두 첫 줄에서 defer()를 부르므로, 이후 발생한 오류를
+    response.send_message로 보내려 하면 이미 is_done()이라 아무것도 전송되지
+    않고 사용자는 '생각 중...' 상태에 갇힌다.
+    """
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content)
+        else:
+            await interaction.response.send_message(content, ephemeral=ephemeral)
+    except discord.HTTPException as e:
+        print(f"[ERROR] 응답 전달 실패: {e!r}")
+
+
 async def respond_with_summary(interaction: discord.Interaction, collected: list[str], notice: str = ""):
     if not collected:
-        await interaction.followup.send("요약할 대화가 없어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
+        await reply(interaction, "요약할 대화가 없어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
         return
 
     try:
@@ -165,10 +181,10 @@ async def respond_with_summary(interaction: discord.Interaction, collected: list
             await interaction.followup.send(chunk)
 
     except asyncio.TimeoutError:
-        await interaction.followup.send("요약 생성이 너무 오래 걸려 중단했어요. 잠시 후 다시 시도해주세요.")
+        await reply(interaction, "요약 생성이 너무 오래 걸려 중단했어요. 잠시 후 다시 시도해주세요.")
     except Exception as e:
-        print(f"[ERROR] 요약 처리 중 오류: {e}")
-        await interaction.followup.send("요약 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.")
+        print(f"[ERROR] 요약 처리 중 오류: {e!r}")
+        await reply(interaction, "요약 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.")
 
 
 intents = discord.Intents.default()
@@ -197,10 +213,21 @@ async def on_ready():
 async def summarize_recent(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
+    # 유저 설치(user install) 상황에서는 인터랙션에 채널 정보가 안 실려 올 수 있다.
+    channel = interaction.channel
+    if channel is None:
+        await reply(
+            interaction,
+            "여기서는 채널 정보를 가져올 수 없어요.\n"
+            "메시지 우클릭 → 앱 → **이 메시지부터 요약**을 이용해주세요."
+        )
+        return
+
     try:
-        collected = await collect_recent(interaction.channel, count=100)
+        collected = await collect_recent(channel, count=100)
     except (discord.Forbidden, discord.HTTPException):
-        await interaction.followup.send(
+        await reply(
+            interaction,
             "이 채널의 대화 기록을 읽을 수 없어요.\n"
             "봇이 초대되지 않은 서버에서는 메시지 우클릭 → 앱 → **이 메시지부터 요약**으로 선택한 메시지만 요약할 수 있어요."
         )
@@ -218,8 +245,10 @@ async def summarize_from_message(interaction: discord.Interaction, message: disc
 
     notice = ""
     try:
+        # interaction.channel과 달리 resolved 메시지의 channel은 항상 채워져 있다
+        # (없으면 PartialMessageable로 대체됨).
         collected = await collect_from_message(
-            channel=interaction.channel,
+            channel=message.channel,
             start_message=message,
             limit=100,
         )
@@ -234,14 +263,14 @@ async def summarize_from_message(interaction: discord.Interaction, message: disc
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CommandOnCooldown):
-        await interaction.response.send_message(
+        await reply(
+            interaction,
             f"**잠시 쉬어가는 중이에요!** {error.retry_after:.0f}초 후에 다시 사용할 수 있어요. (1분에 최대 3회)",
             ephemeral=True,
         )
         return
-    print(f"[ERROR] 커맨드 처리 중 오류: {error}")
-    if not interaction.response.is_done():
-        await interaction.response.send_message("문제가 발생했어요. 잠시 후 다시 시도해주세요.", ephemeral=True)
+    print(f"[ERROR] 커맨드 처리 중 오류: {error!r}")
+    await reply(interaction, "문제가 발생했어요. 잠시 후 다시 시도해주세요.")
 
 
 if __name__ == "__main__":
