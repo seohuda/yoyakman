@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 
 import discord
@@ -238,10 +239,19 @@ async def on_ready():
     print("사용법: /요약 또는 메시지 우클릭 → 앱 → 이 메시지부터 요약")
 
 
+COOLDOWN_RATE = 3
+COOLDOWN_PER = 60
+
+# checks.cooldown()은 호출될 때마다 새 버킷(mapping)을 만든다. 커맨드마다
+# 데코레이터를 따로 붙이면 버킷도 따로 생겨서, 안내와 달리 사용자 1명이
+# 분당 6회를 쓸 수 있었다. 데코레이터를 한 번만 만들어 두 커맨드가 공유한다.
+summary_cooldown = app_commands.checks.cooldown(COOLDOWN_RATE, COOLDOWN_PER)
+
+
 @bot.tree.command(name="요약", description="이 채널의 최근 대화를 최대 100개까지 요약해요")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.checks.cooldown(3, 60)
+@summary_cooldown
 async def summarize_recent(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
@@ -274,7 +284,7 @@ async def summarize_recent(interaction: discord.Interaction):
 @bot.tree.context_menu(name="이 메시지부터 요약")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.checks.cooldown(3, 60)
+@summary_cooldown
 async def summarize_from_message(interaction: discord.Interaction, message: discord.Message):
     await interaction.response.defer(thinking=True)
 
@@ -303,7 +313,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     if isinstance(error, app_commands.CommandOnCooldown):
         await reply(
             interaction,
-            f"**잠시 쉬어가는 중이에요!** {error.retry_after:.0f}초 후에 다시 사용할 수 있어요. (1분에 최대 3회)",
+            f"**잠시 쉬어가는 중이에요!** {math.ceil(error.retry_after)}초 후에 다시 사용할 수 있어요. "
+            f"(1분에 최대 {COOLDOWN_RATE}회)",
             ephemeral=True,
         )
         return
