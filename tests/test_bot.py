@@ -18,13 +18,15 @@ class FakeUser:
         self.bot = bot
 
 
-def fake_message(author_name, content, *, bot=False, attachments=(), stickers=(), reference=None):
+def fake_message(author_name, content, *, bot=False, attachments=(), stickers=(), reference=None, msg_id=0):
     return SimpleNamespace(
+        id=msg_id,
         author=FakeUser(author_name, bot=bot),
         clean_content=content,
         attachments=list(attachments),
         stickers=list(stickers),
         reference=reference,
+        channel=SimpleNamespace(),
     )
 
 
@@ -215,14 +217,17 @@ def test_split_for_discord_omits_empty_chunks():
     assert all(chunk for chunk in chunks)
 
 
-async def _fake_history(limit=None, **_kwargs):
-    for i in range(limit or 0):
-        yield fake_message(f"user{i}", f"msg{i}")
+async def _fake_history(limit=None, after=None, **_kwargs):
+    # id 0..9 메시지. after.id=N 이면 N+1부터 아래쪽만.
+    start = (after.id + 1) if after is not None else 0
+    end = 10 if limit is None else min(10, start + limit)
+    for i in range(start, end):
+        yield fake_message(f"user{i}", f"msg{i}", msg_id=i)
 
 
 class FakeChannel:
-    def history(self, *, limit=None, **_kwargs):
-        return _fake_history(limit=limit)
+    def history(self, *, limit=None, after=None, **_kwargs):
+        return _fake_history(limit=limit, after=after)
 
 
 def test_collect_recent_respects_limit():
@@ -230,5 +235,18 @@ def test_collect_recent_respects_limit():
     assert len(collected) == 10
 
 
-def test_default_message_count_is_below_max():
-    assert bot.DEFAULT_MESSAGE_COUNT < bot.MAX_MESSAGES
+def test_collect_below_message_only_gets_start_and_following():
+    start = fake_message("anchor", "start here", msg_id=3)
+    start.channel = FakeChannel()
+    collected = asyncio.run(bot.collect_below_message(start, limit=10))
+    assert collected[0].startswith("anchor:")
+    assert len(collected) == 7
+    assert all("user0" not in line and "user1" not in line and "user2" not in line for line in collected)
+
+
+def test_collect_below_message_stops_at_available_not_channel_tail():
+    """아래에 7개뿐이면 7개만. limit=300이어도 채널 끝 300개를 가져오지 않는다."""
+    start = fake_message("anchor", "start", msg_id=3)
+    start.channel = FakeChannel()
+    collected = asyncio.run(bot.collect_below_message(start, limit=300))
+    assert len(collected) == 7
