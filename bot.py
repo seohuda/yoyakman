@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 
 import discord
 from discord import app_commands
+from discord.app_commands.checks import Cooldown
 from dotenv import load_dotenv
 
 import google.generativeai as genai
@@ -62,6 +63,30 @@ def sanitize_speaker(name: str) -> str:
     return sanitize(discord.utils.escape_mentions(name.replace(":", "：")))
 
 
+def text_from_response(response) -> str:
+    """Gemini 응답에서 사용자에게 보낼 본문을 꺼낸다. 빈 텍스트는 실패다."""
+    if not response.candidates:
+        raise ValueError("AI가 응답을 생성하지 못했습니다 (finish_reason=NO_CANDIDATES).")
+
+    candidate = response.candidates[0]
+    reason = candidate.finish_reason
+
+    # MAX_TOKENS는 생성이 막힌 게 아니라 출력 길이에 걸려 잘린 것뿐이다.
+    # 이걸 실패로 처리하면 대화가 길수록 요약이 통째로 날아간다.
+    if reason not in FINISH_STOP + FINISH_MAX_TOKENS:
+        raise ValueError(f"AI가 응답을 생성하지 못했습니다 (finish_reason={reason}).")
+
+    content = getattr(candidate, "content", None)
+    parts = getattr(content, "parts", None) or []
+    text = "".join(getattr(part, "text", None) or "" for part in parts).strip()
+    if not text:
+        raise ValueError(f"AI가 빈 응답을 반환했습니다 (finish_reason={reason}).")
+
+    if reason in FINISH_MAX_TOKENS:
+        return text + TRUNCATED_NOTICE
+    return text
+
+
 async def summarize_with_ai(chat_text: str) -> str:
     prompt = f"""[SYSTEM]
 Role: 한국어 디스코드 채팅 로그 전문 요약가
@@ -116,25 +141,7 @@ Goal: 채팅 로그를 정밀하게 분석해, 읽지 않은 사람도 대화의
 {CHAT_LOG_FENCE}"""
 
     response = await gemini_model.generate_content_async(prompt)
-
-    if not response.candidates:
-        raise ValueError("AI가 응답을 생성하지 못했습니다 (finish_reason=NO_CANDIDATES).")
-
-    candidate = response.candidates[0]
-    reason = candidate.finish_reason
-
-    # MAX_TOKENS는 생성이 막힌 게 아니라 출력 길이에 걸려 잘린 것뿐이다.
-    # 이걸 실패로 처리하면 대화가 길수록 요약이 통째로 날아간다.
-    if reason not in FINISH_STOP + FINISH_MAX_TOKENS:
-        raise ValueError(f"AI가 응답을 생성하지 못했습니다 (finish_reason={reason}).")
-
-    # 파트가 비어 있으면 response.text가 예외를 던진다. 잘린 응답에서 실제로 생긴다.
-    if not candidate.content.parts:
-        raise ValueError(f"AI가 빈 응답을 반환했습니다 (finish_reason={reason}).")
-
-    if reason in FINISH_MAX_TOKENS:
-        return response.text + TRUNCATED_NOTICE
-    return response.text
+    return text_from_response(response)
 
 
 def display_name_of(user: discord.User | discord.Member) -> str:
@@ -229,7 +236,7 @@ async def reply(interaction: discord.Interaction, content: str, *, ephemeral: bo
     """
     try:
         if interaction.response.is_done():
-            await interaction.followup.send(content)
+            await interaction.followup.send(content, ephemeral=ephemeral)
         else:
             await interaction.response.send_message(content, ephemeral=ephemeral)
     except discord.HTTPException as e:
@@ -240,26 +247,35 @@ async def respond_with_summary(interaction: discord.Interaction, collected: list
     if not collected:
         # notice에는 왜 이만큼밖에 못 읽었는지가 담겨 있다. 정작 아무것도
         # 못 모은 이 경우에 그걸 빼면 "기다리면 된다"는 잘못된 안내가 된다.
+        refund_summary_cooldown(interaction)
         await reply(interaction, f"{notice}요약할 대화를 찾지 못했어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
         return
 
     try:
         chat_text = "\n".join(collected)
         summary = await asyncio.wait_for(summarize_with_ai(chat_text), timeout=SUMMARY_TIMEOUT)
-
-        header = (
-            f"**채팅 요약** · 메시지 **{len(collected)}개** 분석\n"
-            f"{notice}"
-            f"{'─' * 30}\n"
-        )
-        for chunk in split_for_discord(header + summary):
-            await interaction.followup.send(chunk)
-
     except asyncio.TimeoutError:
         await reply(interaction, "요약 생성이 너무 오래 걸려 중단했어요. 잠시 후 다시 시도해주세요.")
+        return
     except Exception as e:
         print(f"[ERROR] 요약 처리 중 오류: {e!r}")
         await reply(interaction, "요약 중 문제가 발생했어요. 잠시 후 다시 시도해주세요.")
+        return
+
+    header = (
+        f"**채팅 요약** · 메시지 **{len(collected)}개** 분석\n"
+        f"{notice}"
+        f"{'─' * 30}\n"
+    )
+    sent = 0
+    try:
+        for chunk in split_for_discord(header + summary):
+            await interaction.followup.send(chunk)
+            sent += 1
+    except discord.HTTPException as e:
+        print(f"[ERROR] 요약 전송 실패: {e!r}")
+        if sent == 0:
+            await reply(interaction, "요약을 보내는데 실패했어요. 잠시 후 다시 시도해주세요.")
 
 
 intents = discord.Intents.default()
@@ -284,7 +300,7 @@ async def setup_hook():
     try:
         synced = await tree.sync()
         print(f"슬래시 커맨드 동기화 완료: {len(synced)}개")
-    except discord.HTTPException as e:
+    except Exception as e:
         print(f"[WARN] 슬래시 커맨드 동기화 실패, 기존 등록분으로 계속 진행합니다: {e!r}")
 
 
@@ -298,10 +314,38 @@ async def on_ready():
 COOLDOWN_RATE = 3
 COOLDOWN_PER = 60
 
-# checks.cooldown()은 호출될 때마다 새 버킷(mapping)을 만든다. 커맨드마다
-# 데코레이터를 따로 붙이면 버킷도 따로 생겨서, 안내와 달리 사용자 1명이
-# 분당 6회를 쓸 수 있었다. 데코레이터를 한 번만 만들어 두 커맨드가 공유한다.
-summary_cooldown = app_commands.checks.cooldown(COOLDOWN_RATE, COOLDOWN_PER)
+# checks.cooldown()은 호출될 때마다 새 버킷을 만든다. 커맨드마다 데코레이터를
+# 따로 붙이면 안내와 달리 분당 6회가 된다. 버킷을 직접 들고 두 커맨드가 공유한다.
+_summary_buckets: dict[object, Cooldown] = {}
+
+
+async def check_summary_cooldown(interaction: discord.Interaction) -> bool:
+    key = interaction.user.id
+    now = interaction.created_at.timestamp()
+    stale = [k for k, bucket in _summary_buckets.items() if now > bucket._last + bucket.per]
+    for k in stale:
+        del _summary_buckets[k]
+
+    bucket = _summary_buckets.get(key)
+    if bucket is None:
+        bucket = Cooldown(COOLDOWN_RATE, COOLDOWN_PER)
+        _summary_buckets[key] = bucket
+
+    retry_after = bucket.update_rate_limit(now)
+    if retry_after is not None:
+        raise app_commands.CommandOnCooldown(bucket, retry_after)
+    return True
+
+
+def refund_summary_cooldown(interaction: discord.Interaction) -> None:
+    """요약을 한 줄도 주지 못한 실패에서는 방금 깎인 쿨다운을 되돌린다."""
+    bucket = _summary_buckets.get(interaction.user.id)
+    if bucket is None:
+        return
+    bucket._tokens = min(bucket.rate, bucket._tokens + 1)
+
+
+summary_cooldown = app_commands.check(check_summary_cooldown)
 
 
 @tree.command(name="요약", description=f"이 채널의 최근 대화를 최대 {MAX_MESSAGES}개까지 요약해요")
@@ -314,6 +358,7 @@ async def summarize_recent(interaction: discord.Interaction):
     # 유저 설치(user install) 상황에서는 인터랙션에 채널 정보가 안 실려 올 수 있다.
     channel = interaction.channel
     if channel is None:
+        refund_summary_cooldown(interaction)
         await reply(
             interaction,
             "여기서는 채널 정보를 가져올 수 없어요.\n"
@@ -327,6 +372,7 @@ async def summarize_recent(interaction: discord.Interaction):
         # 권한/접근 문제만 여기서 안내한다. 429나 5xx까지 잡아버리면
         # 일시적 장애를 '권한 없음'으로 잘못 알리고 원인도 못 남긴다.
         print(f"[INFO] 채널 기록 접근 불가: {e!r}")
+        refund_summary_cooldown(interaction)
         await reply(
             interaction,
             "이 채널의 대화 기록을 읽을 수 없어요.\n"
@@ -377,7 +423,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         )
         return
     print(f"[ERROR] 커맨드 처리 중 오류: {error!r}")
-    await reply(interaction, "문제가 발생했어요. 잠시 후 다시 시도해주세요.")
+    await reply(interaction, "문제가 발생했어요. 잠시 후 다시 시도해주세요.", ephemeral=True)
 
 
 if __name__ == "__main__":
