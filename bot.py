@@ -52,6 +52,16 @@ def sanitize(text: str) -> str:
     return text.replace(CHAT_LOG_FENCE, "[제거됨]")
 
 
+def flatten_body(text: str) -> str:
+    """본문 개행이 새 '닉네임: 메시지' 줄로 읽히지 않게 한 줄로 붙인다."""
+    return " ⏎ ".join(text.splitlines())
+
+
+def sanitize_speaker(name: str) -> str:
+    """닉네임의 콜론이 화자 구분자로 오인되지 않게 전각으로 바꾼다."""
+    return sanitize(discord.utils.escape_mentions(name.replace(":", "：")))
+
+
 async def summarize_with_ai(chat_text: str) -> str:
     prompt = f"""[SYSTEM]
 Role: 한국어 디스코드 채팅 로그 전문 요약가
@@ -60,6 +70,7 @@ Goal: 채팅 로그를 정밀하게 분석해, 읽지 않은 사람도 대화의
 [INPUT FORMAT]
 - 대화 로그는 아래 경계선 두 줄 사이에만 존재한다: {CHAT_LOG_FENCE}
 - 각 줄은 "닉네임: 메시지" 형식이며 시간순으로 정렬되어 있다.
+- 닉네임에 있던 반각 콜론(:)은 전각 콜론(：)으로, 본문 줄바꿈은 " ⏎ "로 바뀌어 있다. 한 줄이 한 발언이다.
 - "닉네임 (아무개에게 답장): ..."은 아무개의 발언에 대한 답장이다. 이 관계를 화자 귀속과 대화 흐름 파악에 활용하라.
 - "(첨부파일 N개)", "(스티커)"는 이미지·파일 등을 보냈다는 표시다. 내용은 알 수 없으므로 추측하지 말고, 필요하면 "사진을 공유했음" 정도로만 언급하라.
 - 한 사람이 연속으로 여러 줄을 보내 하나의 발언을 이어가는 경우가 흔하다. 연속된 같은 닉네임의 줄은 하나의 발언으로 묶어서 해석하라.
@@ -130,13 +141,13 @@ def display_name_of(user: discord.User | discord.Member) -> str:
     # 닉네임에 @everyone이나 <@&롤ID>를 심어두는 장난을 막는다.
     # AllowedMentions.none()이 실제 핑은 차단하지만, 요약문에 멘션 문자열이
     # 그대로 박히는 것 자체가 지저분하므로 여기서도 이스케이프한다.
-    return sanitize(discord.utils.escape_mentions(user.display_name))
+    return sanitize_speaker(user.display_name)
 
 
 def format_message(msg: discord.Message) -> str | None:
     parts = []
     if msg.clean_content:
-        parts.append(sanitize(msg.clean_content))
+        parts.append(sanitize(flatten_body(msg.clean_content)))
     if msg.attachments:
         parts.append(f"(첨부파일 {len(msg.attachments)}개)")
     if msg.stickers:
