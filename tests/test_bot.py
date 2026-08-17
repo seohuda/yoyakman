@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from discord import app_commands
 
 import bot
 import discord
@@ -166,3 +167,33 @@ def test_empty_collection_refunds_cooldown():
         await bot.check_summary_cooldown(interaction)
 
     asyncio.run(run())
+
+
+def test_cooldown_window_phrase_tracks_seconds():
+    assert bot.cooldown_window_phrase(60) == "1분에"
+    assert bot.cooldown_window_phrase(120) == "2분에"
+    assert bot.cooldown_window_phrase(45) == "45초에"
+
+
+def test_cooldown_error_copy_uses_constants():
+    interaction = _interaction(done=False)
+    error = app_commands.CommandOnCooldown(MagicMock(), 7.2)
+
+    asyncio.run(bot.on_app_command_error(interaction, error))
+    text = interaction.response.send_message.await_args.args[0]
+    assert bot.cooldown_window_phrase(int(bot.COOLDOWN_PER)) in text
+    assert str(bot.COOLDOWN_RATE) in text
+    assert "8초" in text
+
+
+def test_format_if_human_skips_bots():
+    assert bot.format_if_human(fake_message("봇", "hi", bot=True)) is None
+    line = bot.format_if_human(fake_message("사람", "hi"))
+    assert line is not None
+    assert line.startswith("사람:")
+
+
+def test_accepted_finish_reasons_are_proto_enums():
+    assert bot.FinishReason.STOP in bot.FINISH_OK
+    assert bot.FinishReason.MAX_TOKENS in bot.FINISH_OK
+    assert bot.FinishReason.SAFETY not in bot.FINISH_OK

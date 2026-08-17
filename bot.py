@@ -38,9 +38,9 @@ gemini_model = genai.GenerativeModel(
 # 사용자가 이 문자열을 흉내 내 로그 밖으로 빠져나가지 못하도록 sanitize()에서 제거한다.
 CHAT_LOG_FENCE = "-----CHAT_LOG_BOUNDARY_a41f7c-----"
 
-# finish_reason은 정수 enum이지만 라이브러리 버전에 따라 문자열로 보일 수 있어 둘 다 받는다.
-FINISH_STOP = (1, "STOP")
-FINISH_MAX_TOKENS = (2, "MAX_TOKENS")
+# finish_reason은 proto enum이다. 정수/문자열 리터럴을 매번 튜플로 만들지 않는다.
+FinishReason = genai.protos.Candidate.FinishReason
+FINISH_OK = frozenset({FinishReason.STOP, FinishReason.MAX_TOKENS})
 
 TRUNCATED_NOTICE = (
     "\n\n-# 대화가 길어 요약이 여기서 끊겼어요. "
@@ -73,7 +73,7 @@ def text_from_response(response) -> str:
 
     # MAX_TOKENS는 생성이 막힌 게 아니라 출력 길이에 걸려 잘린 것뿐이다.
     # 이걸 실패로 처리하면 대화가 길수록 요약이 통째로 날아간다.
-    if reason not in FINISH_STOP + FINISH_MAX_TOKENS:
+    if reason not in FINISH_OK:
         raise ValueError(f"AI가 응답을 생성하지 못했습니다 (finish_reason={reason}).")
 
     content = getattr(candidate, "content", None)
@@ -82,7 +82,7 @@ def text_from_response(response) -> str:
     if not text:
         raise ValueError(f"AI가 빈 응답을 반환했습니다 (finish_reason={reason}).")
 
-    if reason in FINISH_MAX_TOKENS:
+    if reason == FinishReason.MAX_TOKENS:
         return text + TRUNCATED_NOTICE
     return text
 
@@ -170,13 +170,17 @@ def format_message(msg: discord.Message) -> str | None:
     return f"{display_name_of(msg.author)}{reply_to}: {' '.join(parts)}"
 
 
+def format_if_human(msg: discord.Message) -> str | None:
+    if msg.author.bot:
+        return None
+    return format_message(msg)
+
+
 async def collect_formatted(history: AsyncIterator[discord.Message]) -> list[str]:
     """히스토리에서 봇 메시지를 걸러내고 요약용 줄로 바꾼다."""
     messages = []
     async for msg in history:
-        if msg.author.bot:
-            continue
-        formatted = format_message(msg)
+        formatted = format_if_human(msg)
         if formatted:
             messages.append(formatted)
     return messages
@@ -190,12 +194,11 @@ async def collect_from_message(
     messages = []
     remaining = limit
 
-    if not start_message.author.bot:
-        formatted = format_message(start_message)
-        if formatted:
-            messages.append(formatted)
-            # 시작 메시지도 정원에 포함시킨다. 안 그러면 limit + 1개가 된다.
-            remaining -= 1
+    formatted = format_if_human(start_message)
+    if formatted:
+        messages.append(formatted)
+        # 시작 메시지도 정원에 포함시킨다. 안 그러면 limit + 1개가 된다.
+        remaining -= 1
 
     messages += await collect_formatted(
         channel.history(after=start_message, limit=remaining, oldest_first=True)
@@ -345,6 +348,12 @@ def refund_summary_cooldown(interaction: discord.Interaction) -> None:
     bucket._tokens = min(bucket.rate, bucket._tokens + 1)
 
 
+def cooldown_window_phrase(seconds: int) -> str:
+    if seconds % 60 == 0:
+        return f"{seconds // 60}분에"
+    return f"{seconds}초에"
+
+
 summary_cooldown = app_commands.check(check_summary_cooldown)
 
 
@@ -405,7 +414,7 @@ async def summarize_from_message(interaction: discord.Interaction, message: disc
         print(f"[INFO] 채널 기록 접근 불가, 선택 메시지만 요약: {e!r}")
         # 정상 경로와 동일하게 봇 메시지는 제외한다. 안 그러면 다른 봇이나
         # 자기 자신의 이전 요약을 다시 요약하는 일이 생긴다.
-        formatted = format_message(message) if not message.author.bot else None
+        formatted = format_if_human(message)
         collected = [formatted] if formatted else []
         notice = "-# 봇이 없는 곳이라 채널 기록을 읽을 수 없어, 선택한 메시지만 볼 수 있었어요.\n"
 
@@ -418,7 +427,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await reply(
             interaction,
             f"**잠시 쉬어가는 중이에요!** {math.ceil(error.retry_after)}초 후에 다시 사용할 수 있어요. "
-            f"(1분에 최대 {COOLDOWN_RATE}회)",
+            f"({cooldown_window_phrase(int(COOLDOWN_PER))} 최대 {COOLDOWN_RATE}회)",
             ephemeral=True,
         )
         return
