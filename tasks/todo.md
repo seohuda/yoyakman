@@ -70,3 +70,40 @@
 - `google.generativeai` 패키지가 지원 종료됨. import 시 FutureWarning이
   뜬다. `google-genai`로 이관 필요.
 - 요약 정확도 자체는 실제 Gemini 호출 없이는 검증할 수 없어 손대지 않았다.
+
+---
+
+# 수집 상한 100 → 300
+
+100은 API 한계가 아니라 우리가 박아둔 상수였다. 디스코드 REST는 한 요청당
+100개가 상한이지만 `abc.py:2040`의 `retrieve = min(limit, 100)` 루프가
+100개씩 나눠 받아오므로 `limit`만 올리면 된다(300 → HTTP 3회).
+
+- [x] `MAX_MESSAGES` 300
+- [x] `max_output_tokens=4096` 명시 — 기본값에 맡기면 참가자 많은 대화에서
+      출력이 잘리고 `finish_reason=MAX_TOKENS`가 되어 요약이 통째로 실패했다
+- [x] `MAX_TOKENS`를 실패로 보지 않고, 생성된 앞부분 + 끊김 안내로 응답
+- [x] 파트가 빈 응답은 `response.text` 접근 전에 걸러냄
+      (`generation_types.py`의 `text` 접근자가 parts 없을 때 ValueError)
+- [x] 타임아웃 90s → 120s (입력이 3배가 됐고, defer 후 15분 여유가 있음)
+
+## 검증
+
+`google-generativeai` 0.8.6 + discord.py 2.7.1 실제 설치본으로 확인.
+
+| 시나리오 | 결과 |
+| --- | --- |
+| STOP + 본문 | 그대로 반환, 안내 없음 |
+| MAX_TOKENS + 잘린 본문 | 앞부분 + 끊김 안내 반환 |
+| MAX_TOKENS + 본문 없음 | ValueError (사용자에겐 재시도 안내) |
+| SAFETY(3) | ValueError |
+| 후보 없음 | ValueError |
+| 400개 채널(봇 40개)에서 `collect_recent` | 300개 수집 → 270줄, HTTP 3회 |
+| 같은 채널에서 `collect_from_message` | 시작 메시지 포함 270줄, 상한 초과 없음 |
+| 커맨드 트리 | 2개 등록, 설명 "최대 300개", 쿨다운 버킷 공유 유지 |
+
+## 남은 것
+
+- 300개면 주제가 여러 개 섞이는데 프롬프트의 "전체 흐름 2~4문장",
+  "1인당 1문장" 규칙은 그대로다. 요약이 뭉개지면 섹션 규칙부터 손볼 것.
+- 실제 Gemini 호출 지연은 측정하지 못했다. 120s로도 부족하면 재조정 필요.

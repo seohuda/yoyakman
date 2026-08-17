@@ -14,7 +14,15 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-MAX_MESSAGES = 100
+MAX_MESSAGES = 300
+
+# 출력 상한을 명시한다. 기본값에 맡기면 참가자가 많은 대화에서 요약이
+# 조용히 잘리고, 그게 finish_reason=MAX_TOKENS로 돌아온다.
+MAX_OUTPUT_TOKENS = 4096
+
+# 요약 생성 제한 시간. 입력이 MAX_MESSAGES만큼 늘어난 만큼 여유를 뒀다.
+# 인터랙션 토큰은 defer 후 15분간 유효하므로 이 값이 병목은 아니다.
+SUMMARY_TIMEOUT = 120
 
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel(
@@ -22,6 +30,7 @@ gemini_model = genai.GenerativeModel(
     generation_config=genai.types.GenerationConfig(
         temperature=0.2,
         top_p=0.9,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
     ),
 )
 
@@ -29,6 +38,15 @@ gemini_model = genai.GenerativeModel(
 # 대화 로그를 프롬프트 안에서 확실히 격리하기 위한 경계선.
 # 사용자가 이 문자열을 흉내 내 로그 밖으로 빠져나가지 못하도록 sanitize()에서 제거한다.
 CHAT_LOG_FENCE = "-----CHAT_LOG_BOUNDARY_a41f7c-----"
+
+# finish_reason은 정수 enum이지만 라이브러리 버전에 따라 문자열로 보일 수 있어 둘 다 받는다.
+FINISH_STOP = (1, "STOP")
+FINISH_MAX_TOKENS = (2, "MAX_TOKENS")
+
+TRUNCATED_NOTICE = (
+    "\n\n-# 대화가 길어 요약이 여기서 끊겼어요. "
+    "뒤쪽 메시지를 우클릭해 **이 메시지부터 요약**을 쓰면 끝까지 볼 수 있어요."
+)
 
 
 def sanitize(text: str) -> str:
@@ -90,10 +108,23 @@ Goal: 채팅 로그를 정밀하게 분석해, 읽지 않은 사람도 대화의
 
     response = await gemini_model.generate_content_async(prompt)
 
-    if not response.candidates or response.candidates[0].finish_reason not in (1, "STOP"):
-        reason = response.candidates[0].finish_reason if response.candidates else "NO_CANDIDATES"
+    if not response.candidates:
+        raise ValueError("AI가 응답을 생성하지 못했습니다 (finish_reason=NO_CANDIDATES).")
+
+    candidate = response.candidates[0]
+    reason = candidate.finish_reason
+
+    # MAX_TOKENS는 생성이 막힌 게 아니라 출력 길이에 걸려 잘린 것뿐이다.
+    # 이걸 실패로 처리하면 대화가 길수록 요약이 통째로 날아간다.
+    if reason not in FINISH_STOP + FINISH_MAX_TOKENS:
         raise ValueError(f"AI가 응답을 생성하지 못했습니다 (finish_reason={reason}).")
 
+    # 파트가 비어 있으면 response.text가 예외를 던진다. 잘린 응답에서 실제로 생긴다.
+    if not candidate.content.parts:
+        raise ValueError(f"AI가 빈 응답을 반환했습니다 (finish_reason={reason}).")
+
+    if reason in FINISH_MAX_TOKENS:
+        return response.text + TRUNCATED_NOTICE
     return response.text
 
 
@@ -205,7 +236,7 @@ async def respond_with_summary(interaction: discord.Interaction, collected: list
 
     try:
         chat_text = "\n".join(collected)
-        summary = await asyncio.wait_for(summarize_with_ai(chat_text), timeout=90)
+        summary = await asyncio.wait_for(summarize_with_ai(chat_text), timeout=SUMMARY_TIMEOUT)
 
         header = (
             f"**채팅 요약** · 메시지 **{len(collected)}개** 분석\n"
