@@ -16,21 +16,19 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 MAX_MESSAGES = 300
 
-# 출력 상한을 명시한다. 기본값에 맡기면 참가자가 많은 대화에서 요약이
-# 조용히 잘리고, 그게 finish_reason=MAX_TOKENS로 돌아온다.
-MAX_OUTPUT_TOKENS = 4096
-
 # 요약 생성 제한 시간. 입력이 MAX_MESSAGES만큼 늘어난 만큼 여유를 뒀다.
 # 인터랙션 토큰은 defer 후 15분간 유효하므로 이 값이 병목은 아니다.
 SUMMARY_TIMEOUT = 120
 
 genai.configure(api_key=GEMINI_API_KEY)
+# max_output_tokens를 지정하지 않는다. gemini-2.5는 사고 토큰이 출력
+# 상한에 포함되어, 4096처럼 낮게 깎으면 본문 없이 MAX_TOKENS만 돌아온다.
+# 모델 기본값(flash는 65,536)을 쓰고, 정말 잘린 경우만 TRUNCATED_NOTICE를 붙인다.
 gemini_model = genai.GenerativeModel(
     "gemini-2.5-flash",
     generation_config=genai.types.GenerationConfig(
         temperature=0.2,
         top_p=0.9,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
     ),
 )
 
