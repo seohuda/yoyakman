@@ -16,6 +16,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 MAX_MESSAGES = 300
+DEFAULT_MESSAGE_COUNT = 50
 # 300개 × 최대 4000자면 프롬프트가 메가바이트 단위가 된다. 오래된 줄부터 버린다.
 MAX_LOG_CHARS = 200_000
 
@@ -381,11 +382,15 @@ def cooldown_window_phrase(seconds: int) -> str:
 summary_cooldown = app_commands.check(check_summary_cooldown)
 
 
-@tree.command(name="요약", description=f"이 채널의 최근 대화를 최대 {MAX_MESSAGES}개까지 요약해요")
+@tree.command(name="요약", description=f"이 채널의 최근 대화를 요약해요 (최대 {MAX_MESSAGES}개)")
+@app_commands.describe(개수=f"요약할 최근 메시지 개수 (기본 {DEFAULT_MESSAGE_COUNT}, 최대 {MAX_MESSAGES})")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @summary_cooldown
-async def summarize_recent(interaction: discord.Interaction):
+async def summarize_recent(
+    interaction: discord.Interaction,
+    개수: app_commands.Range[int, 5, MAX_MESSAGES] = DEFAULT_MESSAGE_COUNT,
+):
     await interaction.response.defer(thinking=True)
 
     # 유저 설치(user install) 상황에서는 인터랙션에 채널 정보가 안 실려 올 수 있다.
@@ -400,7 +405,7 @@ async def summarize_recent(interaction: discord.Interaction):
         return
 
     try:
-        collected = await collect_recent(channel, limit=MAX_MESSAGES)
+        collected = await collect_recent(channel, limit=개수)
     except (discord.Forbidden, discord.NotFound) as e:
         # 권한/접근 문제만 여기서 안내한다. 429나 5xx까지 잡아버리면
         # 일시적 장애를 '권한 없음'으로 잘못 알리고 원인도 못 남긴다.
