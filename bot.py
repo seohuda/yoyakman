@@ -16,7 +16,6 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 MAX_MESSAGES = 300
-DEFAULT_MESSAGE_COUNT = 50
 # 300개 × 최대 4000자면 프롬프트가 메가바이트 단위가 된다. 오래된 줄부터 버린다.
 MAX_LOG_CHARS = 200_000
 
@@ -192,20 +191,25 @@ async def collect_formatted(history: AsyncIterator[discord.Message]) -> list[str
 async def collect_from_message(
     channel: discord.abc.Messageable,
     start_message: discord.Message,
-    limit: int = MAX_MESSAGES,
+    limit: int | None = MAX_MESSAGES,
 ) -> list[str]:
+    """시작 메시지와 그 아래(이후) 메시지만 모은다. 채널 최근 N개와 다르다."""
     messages = []
-    remaining = limit
+    start_id = start_message.id
 
     formatted = format_if_human(start_message)
     if formatted:
         messages.append(formatted)
-        # 시작 메시지도 정원에 포함시킨다. 안 그러면 limit + 1개가 된다.
-        remaining -= 1
 
-    messages += await collect_formatted(
-        channel.history(after=start_message, limit=remaining, oldest_first=True)
-    )
+    async for msg in channel.history(after=start_message, oldest_first=True):
+        if msg.id <= start_id:
+            continue
+        if limit is not None and len(messages) >= limit:
+            break
+        formatted = format_if_human(msg)
+        if formatted:
+            messages.append(formatted)
+
     return messages
 
 
@@ -216,6 +220,19 @@ async def collect_recent(
     messages = await collect_formatted(channel.history(limit=limit))
     messages.reverse()  # history()는 최신순이므로 시간순으로 되돌린다
     return messages
+
+
+async def collect_below_message(
+    start_message: discord.Message,
+    *,
+    limit: int = MAX_MESSAGES,
+) -> list[str]:
+    """선택 메시지부터 아래(이후) 대화만. 채널 끝에서 최근 N개를 가져오지 않는다."""
+    return await collect_from_message(
+        channel=start_message.channel,
+        start_message=start_message,
+        limit=limit,
+    )
 
 
 def split_for_discord(text: str, limit: int = 2000) -> list[str]:
@@ -383,14 +400,10 @@ summary_cooldown = app_commands.check(check_summary_cooldown)
 
 
 @tree.command(name="요약", description=f"이 채널의 최근 대화를 요약해요 (최대 {MAX_MESSAGES}개)")
-@app_commands.describe(개수=f"요약할 최근 메시지 개수 (기본 {DEFAULT_MESSAGE_COUNT}, 최대 {MAX_MESSAGES})")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @summary_cooldown
-async def summarize_recent(
-    interaction: discord.Interaction,
-    개수: app_commands.Range[int, 5, MAX_MESSAGES] = DEFAULT_MESSAGE_COUNT,
-):
+async def summarize_recent(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
     # 유저 설치(user install) 상황에서는 인터랙션에 채널 정보가 안 실려 올 수 있다.
@@ -405,7 +418,7 @@ async def summarize_recent(
         return
 
     try:
-        collected = await collect_recent(channel, limit=개수)
+        collected = await collect_recent(channel, limit=MAX_MESSAGES)
     except (discord.Forbidden, discord.NotFound) as e:
         # 권한/접근 문제만 여기서 안내한다. 429나 5xx까지 잡아버리면
         # 일시적 장애를 '권한 없음'으로 잘못 알리고 원인도 못 남긴다.
@@ -432,11 +445,12 @@ async def summarize_from_message(interaction: discord.Interaction, message: disc
     try:
         # interaction.channel과 달리 resolved 메시지의 channel은 항상 채워져 있다
         # (없으면 PartialMessageable로 대체됨).
-        collected = await collect_from_message(
-            channel=message.channel,
-            start_message=message,
-            limit=MAX_MESSAGES,
-        )
+        collected = await collect_below_message(message)
+        if len(collected) >= MAX_MESSAGES:
+            notice = (
+                f"-# 선택한 메시지 아래가 {MAX_MESSAGES}개를 넘어 "
+                f"앞쪽 {MAX_MESSAGES}개만 요약했어요.\n"
+            )
     except (discord.Forbidden, discord.NotFound) as e:
         # 봇이 초대되지 않은 서버 등 접근 자체가 막힌 경우에만 폴백한다.
         # 일시적 HTTP 오류는 그대로 올려보내 에러 핸들러가 안내하게 둔다.
