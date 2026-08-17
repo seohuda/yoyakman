@@ -206,3 +206,10 @@ def test_char_limit_drops_oldest_lines():
 
 def test_char_limit_keeps_newest_even_if_it_exceeds():
     assert bot.trim_oldest_to_char_limit(["old", "toolong"], 3) == ["toolong"]
+
+
+def test_split_for_discord_omits_empty_chunks():
+    assert bot.split_for_discord("") == []
+    chunks = bot.split_for_discord(("a" * 2000) + "\n\n" + ("b" * 10))
+    assert chunks
+    assert all(chunk for chunk in chunks)

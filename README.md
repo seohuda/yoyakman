@@ -27,6 +27,13 @@ cp .env.example .env
 python bot.py
 ```
 
+로컬 검증:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
 ## 사용 방법
 
 **최근 대화 요약**
