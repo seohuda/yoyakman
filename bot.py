@@ -16,6 +16,8 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 MAX_MESSAGES = 300
+# 300개 × 최대 4000자면 프롬프트가 메가바이트 단위가 된다. 오래된 줄부터 버린다.
+MAX_LOG_CHARS = 200_000
 
 # 요약 생성 제한 시간. 입력이 MAX_MESSAGES만큼 늘어난 만큼 여유를 뒀다.
 # 인터랙션 토큰은 defer 후 15분간 유효하므로 이 값이 병목은 아니다.
@@ -230,6 +232,26 @@ def split_for_discord(text: str, limit: int = 2000) -> list[str]:
     return chunks
 
 
+def trim_oldest_to_char_limit(lines: list[str], limit: int = MAX_LOG_CHARS) -> list[str]:
+    """시간순 로그에서 오래된 줄을 버려 문자 수 상한 안에 넣는다.
+
+    가장 최근 한 줄이 상한을 넘으면 그 줄은 남긴다. 안 그러면 요약할
+    입력이 통째로 사라진다.
+    """
+    if not lines:
+        return []
+    kept: list[str] = []
+    total = 0
+    for line in reversed(lines):
+        extra = len(line) + (1 if kept else 0)
+        if kept and total + extra > limit:
+            break
+        kept.append(line)
+        total += extra
+    kept.reverse()
+    return kept
+
+
 async def reply(interaction: discord.Interaction, content: str, *, ephemeral: bool = False) -> None:
     """defer() 이후에도 반드시 사용자에게 응답이 닿게 한다.
 
@@ -253,6 +275,8 @@ async def respond_with_summary(interaction: discord.Interaction, collected: list
         refund_summary_cooldown(interaction)
         await reply(interaction, f"{notice}요약할 대화를 찾지 못했어요. 대화가 더 쌓인 뒤에 다시 시도해주세요.")
         return
+
+    collected = trim_oldest_to_char_limit(collected)
 
     try:
         chat_text = "\n".join(collected)

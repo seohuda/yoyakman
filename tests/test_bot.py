@@ -197,3 +197,12 @@ def test_accepted_finish_reasons_are_proto_enums():
     assert bot.FinishReason.STOP in bot.FINISH_OK
     assert bot.FinishReason.MAX_TOKENS in bot.FINISH_OK
     assert bot.FinishReason.SAFETY not in bot.FINISH_OK
+
+
+def test_char_limit_drops_oldest_lines():
+    lines = ["aaaa", "bb", "c"]
+    assert bot.trim_oldest_to_char_limit(lines, 4) == ["bb", "c"]
+
+
+def test_char_limit_keeps_newest_even_if_it_exceeds():
+    assert bot.trim_oldest_to_char_limit(["old", "toolong"], 3) == ["toolong"]
