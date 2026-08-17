@@ -213,3 +213,22 @@ def test_split_for_discord_omits_empty_chunks():
     chunks = bot.split_for_discord(("a" * 2000) + "\n\n" + ("b" * 10))
     assert chunks
     assert all(chunk for chunk in chunks)
+
+
+async def _fake_history(limit=None, **_kwargs):
+    for i in range(limit or 0):
+        yield fake_message(f"user{i}", f"msg{i}")
+
+
+class FakeChannel:
+    def history(self, *, limit=None, **_kwargs):
+        return _fake_history(limit=limit)
+
+
+def test_collect_recent_respects_limit():
+    collected = asyncio.run(bot.collect_recent(FakeChannel(), limit=10))
+    assert len(collected) == 10
+
+
+def test_default_message_count_is_below_max():
+    assert bot.DEFAULT_MESSAGE_COUNT < bot.MAX_MESSAGES
