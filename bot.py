@@ -46,7 +46,7 @@ FINISH_OK = frozenset({FinishReason.STOP, FinishReason.MAX_TOKENS})
 
 TRUNCATED_NOTICE = (
     "\n\n-# 대화가 길어 요약이 여기서 끊겼어요. "
-    "뒤쪽 메시지를 우클릭해 **이 메시지부터 요약**을 쓰면 끝까지 볼 수 있어요."
+    "뒤쪽 메시지를 우클릭해 **요약**을 쓰면 끝까지 볼 수 있어요."
 )
 
 
@@ -353,7 +353,7 @@ async def setup_hook():
 async def on_ready():
     print(f"봇 로그인 완료: {bot.user} (ID: {bot.user.id})")
     print(f"연결된 서버 수: {len(bot.guilds)}개")
-    print("사용법: /요약 또는 메시지 우클릭 → 앱 → 이 메시지부터 요약")
+    print("사용법: 메시지 우클릭 → 앱 → 요약")
 
 
 COOLDOWN_RATE = 3
@@ -399,42 +399,7 @@ def cooldown_window_phrase(seconds: int) -> str:
 summary_cooldown = app_commands.check(check_summary_cooldown)
 
 
-@tree.command(name="요약", description=f"이 채널의 최근 대화를 요약해요 (최대 {MAX_MESSAGES}개)")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@summary_cooldown
-async def summarize_recent(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-
-    # 유저 설치(user install) 상황에서는 인터랙션에 채널 정보가 안 실려 올 수 있다.
-    channel = interaction.channel
-    if channel is None:
-        refund_summary_cooldown(interaction)
-        await reply(
-            interaction,
-            "여기서는 채널 정보를 가져올 수 없어요.\n"
-            "메시지 우클릭 → 앱 → **이 메시지부터 요약**을 이용해주세요."
-        )
-        return
-
-    try:
-        collected = await collect_recent(channel, limit=MAX_MESSAGES)
-    except (discord.Forbidden, discord.NotFound) as e:
-        # 권한/접근 문제만 여기서 안내한다. 429나 5xx까지 잡아버리면
-        # 일시적 장애를 '권한 없음'으로 잘못 알리고 원인도 못 남긴다.
-        print(f"[INFO] 채널 기록 접근 불가: {e!r}")
-        refund_summary_cooldown(interaction)
-        await reply(
-            interaction,
-            "이 채널의 대화 기록을 읽을 수 없어요.\n"
-            "봇이 초대되지 않은 서버에서는 메시지 우클릭 → 앱 → **이 메시지부터 요약**으로 선택한 메시지만 요약할 수 있어요."
-        )
-        return
-
-    await respond_with_summary(interaction, collected)
-
-
-@tree.context_menu(name="이 메시지부터 요약")
+@tree.context_menu(name="요약")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @summary_cooldown
