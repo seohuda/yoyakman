@@ -277,11 +277,38 @@ def test_network_timeout_is_not_blindly_retried():
     assert client.aio.models.generate_content.await_count == 1
 
 
-def test_temporary_transport_error_can_recover():
+def test_temporary_connect_error_can_recover():
     client = client_mock()
     client.aio.models.generate_content.side_effect = [httpx.ConnectError("offline"), response()]
     assert asyncio.run(service(client).summarize("본문")) == "요약 본문"
     assert client.aio.models.generate_content.await_count == 2
+
+
+def test_repeated_connect_error_stops_at_attempt_limit():
+    client = client_mock()
+    client.aio.models.generate_content.side_effect = httpx.ConnectError("no connection")
+    instance = service(client, api_max_attempts=3)
+    with pytest.raises(SummaryError) as error:
+        asyncio.run(instance.summarize("본문"))
+    assert error.value.kind == "unavailable"
+    assert client.aio.models.generate_content.await_count == 3
+    assert instance._sleep.await_count == 2
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError, httpx.CloseError, httpx.ProxyError],
+)
+def test_ambiguous_transport_errors_are_never_retried(error_type):
+    client = client_mock()
+    client.aio.models.generate_content.side_effect = error_type("server may have processed request")
+    instance = service(client, api_max_attempts=3)
+    with pytest.raises(SummaryError) as error:
+        asyncio.run(instance.summarize("본문"))
+    assert error.value.kind == "unavailable"
+    assert "server may have processed request" not in str(error.value)
+    assert client.aio.models.generate_content.await_count == 1
+    instance._sleep.assert_not_awaited()
 
 
 def test_empty_response_does_not_trigger_extra_billable_requests():

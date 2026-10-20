@@ -256,11 +256,17 @@ class GeminiSummarizer:
                 server_delay = retry_after_seconds(error)
                 logger.warning("Gemini retry status=%s attempt=%s", error.code, attempt)
             except httpx.TimeoutException:
+                # A timeout does not prove whether the server processed the request.
                 raise
-            except httpx.TransportError:
+            except httpx.ConnectError:
+                # A connection could not be established; no Gemini request was sent.
                 if attempt == self.settings.api_max_attempts:
                     raise SummaryError("unavailable") from None
-                logger.warning("Gemini transport retry attempt=%s", attempt)
+                logger.warning("Gemini connect retry attempt=%s", attempt)
+            except httpx.TransportError:
+                # Read/write/protocol failures can occur after request delivery.
+                # Retrying them risks duplicate generation and billing.
+                raise SummaryError("unavailable") from None
             else:
                 return text_from_response(response)
             backoff = min(8.0, 2.0 ** (attempt - 1))
