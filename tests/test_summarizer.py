@@ -297,7 +297,13 @@ def test_repeated_connect_error_stops_at_attempt_limit():
 
 @pytest.mark.parametrize(
     "error_type",
-    [httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError, httpx.CloseError, httpx.ProxyError],
+    [
+        httpx.ReadError,
+        httpx.WriteError,
+        httpx.RemoteProtocolError,
+        httpx.CloseError,
+        httpx.ProxyError,
+    ],
 )
 def test_ambiguous_transport_errors_are_never_retried(error_type):
     client = client_mock()
