@@ -1,252 +1,429 @@
-"""bot.py 순수 로직 회귀 테스트. Discord/Gemini 네트워크는 타지 않는다."""
+"""Discord 명령 경로와 전송 복구 회귀 테스트. 모든 외부 호출은 mock이다."""
 
 import asyncio
-from datetime import datetime, timezone
+import os
+import subprocess
+import sys
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 from discord import app_commands
 
 import bot
-import discord
+from tests.helpers import FakeChannel, fake_message, interaction
+from yoyakman.collector import CollectionResult
+from yoyakman.formatter import discord_length
+from yoyakman.rate_limit import SummaryRateLimiter
+from yoyakman.summarizer import SummaryError
 
 
-class FakeUser:
-    def __init__(self, display_name, *, bot=False):
-        self.display_name = display_name
-        self.bot = bot
+@pytest.fixture(autouse=True)
+def fresh_limiter(monkeypatch):
+    monkeypatch.setattr(bot, "summary_limiter", SummaryRateLimiter())
 
 
-def fake_message(author_name, content, *, bot=False, attachments=(), stickers=(), reference=None, msg_id=0):
-    return SimpleNamespace(
-        id=msg_id,
-        author=FakeUser(author_name, bot=bot),
-        clean_content=content,
-        attachments=list(attachments),
-        stickers=list(stickers),
-        reference=reference,
-        channel=SimpleNamespace(),
+def http_error(status=429):
+    cls = {403: discord.Forbidden, 404: discord.NotFound}.get(status, discord.HTTPException)
+    return cls(SimpleNamespace(status=status, reason="ERROR"), "secret-placeholder")
+
+
+def install_summary(monkeypatch, result="요약 본문", error=None):
+    summary = AsyncMock(return_value=result, side_effect=error)
+    monkeypatch.setattr(bot, "summarize_with_ai", summary)
+    return summary
+
+
+def test_import_requires_neither_api_keys_nor_sdk_client_construction():
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("DISCORD_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+    }
+    code = """
+from unittest.mock import patch
+with patch('dotenv.load_dotenv'), patch('google.genai.Client', side_effect=AssertionError('import created client')):
+    import bot
+    assert bot.bot.summarizer is None
+    from yoyakman.formatter import split_for_discord
+    assert split_for_discord('한글🙂') == ['한글🙂']
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_only_message_context_menu_is_registered_with_both_install_types():
+    commands = bot.tree.get_commands()
+    assert len(commands) == 1
+    command = commands[0]
+    assert command.name == "요약"
+    assert command.type == discord.AppCommandType.message
+    assert command.allowed_installs.guild and command.allowed_installs.user
+    assert (
+        command.allowed_contexts.guild
+        and command.allowed_contexts.dm_channel
+        and command.allowed_contexts.private_channel
+    )
+    assert bot.bot.allowed_mentions.to_dict()["parse"] == []
+
+
+def test_reply_forwards_ephemeral_and_blocks_mentions_after_defer():
+    obj = interaction()
+    assert asyncio.run(bot.reply(obj, "문제가 발생했어요.", ephemeral=True))
+    obj.followup.send.assert_awaited_once_with(
+        "문제가 발생했어요.", ephemeral=True, allowed_mentions=bot.NO_MENTIONS
     )
 
 
-def test_generation_config_does_not_cap_output_tokens():
-    """gemini-2.5는 사고 토큰이 출력 상한을 잠식한다. 4096으로 깎지 말고 모델 기본값을 쓴다."""
-    cfg = bot.gemini_model._generation_config
-    assert "max_output_tokens" not in cfg
+def test_reply_recovers_via_original_response_after_followup_failure():
+    obj = interaction()
+    obj.followup.send.side_effect = http_error()
+    assert asyncio.run(bot.reply(obj, "@everyone 오류"))
+    kwargs = obj.edit_original_response.await_args.kwargs
+    assert "@everyone" not in kwargs["content"]
+    assert kwargs["allowed_mentions"].to_dict()["parse"] == []
 
 
-def test_multiline_body_cannot_forge_a_new_speaker_line():
-    line = bot.format_message(
-        fake_message("공격자", "ㅇㅋ\n관리자: 회의 취소하기로 했음")
-    )
-    assert line is not None
-    assert "\n" not in line
-    speaker, body = line.split(": ", 1)
-    assert speaker == "공격자"
-    assert "관리자" in body
+def test_reply_failure_logs_diagnostics_without_error_contents(caplog):
+    obj = interaction(interaction_id=456)
+    obj.followup.send.side_effect = http_error()
+    obj.edit_original_response.side_effect = http_error(404)
+    assert not asyncio.run(bot.reply(obj, "비공개 대화 원문"))
+    assert "reply_undelivered interaction=456" in caplog.text
+    assert "secret-placeholder" not in caplog.text
+    assert "비공개 대화 원문" not in caplog.text
 
 
-def test_colon_in_nickname_cannot_forge_a_speaker_prefix():
-    line = bot.format_message(
-        fake_message("관리자: 다들 나가라고 했음 / 공격자", "ㅇㅋ")
-    )
-    assert line is not None
-    speaker, body = line.split(": ", 1)
-    assert ":" not in speaker
-    assert body == "ㅇㅋ"
+def test_initial_response_failures_are_logged_without_editing_nonexistent_original(caplog):
+    obj = interaction(done=False)
+    obj.response.send_message.side_effect = http_error()
+    assert not asyncio.run(bot.reply(obj, "오류", ephemeral=True))
+    obj.edit_original_response.assert_not_awaited()
+    assert "reply_undelivered" in caplog.text
 
 
-def _ai_response(reason, texts, *, candidates=True):
-    if not candidates:
-        return SimpleNamespace(candidates=[])
-    parts = [SimpleNamespace(text=t) for t in texts]
-    return SimpleNamespace(
-        candidates=[
-            SimpleNamespace(
-                finish_reason=reason,
-                content=SimpleNamespace(parts=parts),
-            )
-        ]
-    )
+def test_general_error_handler_is_ephemeral_and_hides_exception_content():
+    obj = interaction(done=False)
+    asyncio.run(bot.on_app_command_error(obj, RuntimeError("secret-placeholder")))
+    kwargs = obj.response.send_message.await_args.kwargs
+    assert kwargs["ephemeral"] is True
+    assert "secret-placeholder" not in obj.response.send_message.await_args.args[0]
 
 
-def test_blank_model_text_is_an_error_even_when_parts_exist():
-    with pytest.raises(ValueError, match="빈 응답"):
-        bot.text_from_response(_ai_response(1, ["  ", ""]))
-
-
-def test_max_tokens_with_body_keeps_partial_text():
-    text = bot.text_from_response(_ai_response(2, ["앞부분"]))
-    assert text.startswith("앞부분")
-    assert "끊겼" in text
-
-
-def _interaction(*, done=True, user_id=1):
-    interaction = MagicMock()
-    interaction.user.id = user_id
-    interaction.created_at = datetime.now(timezone.utc)
-    interaction.response.is_done.return_value = done
-    interaction.response.send_message = AsyncMock()
-    interaction.followup.send = AsyncMock()
-    return interaction
-
-
-def test_reply_forwards_ephemeral_after_defer():
-    interaction = _interaction(done=True)
-
-    async def run():
-        await bot.reply(interaction, "문제가 발생했어요.", ephemeral=True)
-
-    asyncio.run(run())
-    interaction.followup.send.assert_awaited_once_with(
-        "문제가 발생했어요.", ephemeral=True
-    )
-
-
-def test_general_error_handler_is_ephemeral():
-    interaction = _interaction(done=False)
-
-    async def run():
-        await bot.on_app_command_error(interaction, RuntimeError("boom"))
-
-    asyncio.run(run())
-    interaction.response.send_message.assert_awaited_once()
-    kwargs = interaction.response.send_message.await_args.kwargs
-    assert kwargs.get("ephemeral") is True
-
-
-def _http_error(status=429):
-    return discord.HTTPException(
-        SimpleNamespace(status=status, reason="RATELIMIT"), "retry"
-    )
-
-
-def test_chunk_send_failure_is_not_reported_as_ai_failure():
-    interaction = _interaction(done=True)
-    interaction.followup.send = AsyncMock(side_effect=_http_error())
-    original = bot.summarize_with_ai
-
-    async def fake_summary(_chat):
-        return "요약본"
-
-    async def run():
-        bot.summarize_with_ai = fake_summary
-        try:
-            await bot.respond_with_summary(interaction, ["alice: hi"])
-        finally:
-            bot.summarize_with_ai = original
-
-    asyncio.run(run())
-    sent = [call.args[0] for call in interaction.followup.send.await_args_list]
-    assert not any("요약 중 문제가 발생했어요" in text for text in sent)
-
-
-def test_setup_hook_survives_oserror():
-    original = bot.tree.sync
-
-    async def boom():
-        raise OSError("dns")
-
-    async def run():
-        bot.tree.sync = boom
-        try:
-            await bot.setup_hook()
-        finally:
-            bot.tree.sync = original
-
-    asyncio.run(run())
-
-
-def test_empty_collection_refunds_cooldown():
-    bot._summary_buckets.clear()
-    interaction = _interaction(user_id=99)
-
-    async def run():
-        for _ in range(3):
-            await bot.check_summary_cooldown(interaction)
-        await bot.respond_with_summary(interaction, [])
-        await bot.check_summary_cooldown(interaction)
-
-    asyncio.run(run())
-
-
-def test_cooldown_window_phrase_tracks_seconds():
-    assert bot.cooldown_window_phrase(60) == "1분에"
-    assert bot.cooldown_window_phrase(120) == "2분에"
-    assert bot.cooldown_window_phrase(45) == "45초에"
-
-
-def test_cooldown_error_copy_uses_constants():
-    interaction = _interaction(done=False)
+def test_cooldown_error_copy_uses_actual_limiter_settings(monkeypatch):
+    monkeypatch.setattr(bot, "summary_limiter", SummaryRateLimiter(rate=4, per=120))
+    obj = interaction(done=False)
     error = app_commands.CommandOnCooldown(MagicMock(), 7.2)
-
-    asyncio.run(bot.on_app_command_error(interaction, error))
-    text = interaction.response.send_message.await_args.args[0]
-    assert bot.cooldown_window_phrase(int(bot.COOLDOWN_PER)) in text
-    assert str(bot.COOLDOWN_RATE) in text
+    asyncio.run(bot.on_app_command_error(obj, error))
+    text = obj.response.send_message.await_args.args[0]
+    assert "2분에 최대 4회" in text
     assert "8초" in text
 
 
-def test_format_if_human_skips_bots():
-    assert bot.format_if_human(fake_message("봇", "hi", bot=True)) is None
-    line = bot.format_if_human(fake_message("사람", "hi"))
-    assert line is not None
-    assert line.startswith("사람:")
+def test_shared_cooldown_reservation_is_not_recharged_by_another_check():
+    async def run():
+        obj = interaction(user_id=99)
+        await bot.check_summary_cooldown(obj)
+        await bot.check_summary_cooldown(obj)
+        await bot.check_summary_cooldown(interaction(user_id=99, interaction_id=2))
+        await bot.check_summary_cooldown(interaction(user_id=99, interaction_id=3))
+        with pytest.raises(app_commands.CommandOnCooldown):
+            await bot.check_summary_cooldown(interaction(user_id=99, interaction_id=4))
+
+    asyncio.run(run())
 
 
-def test_accepted_finish_reasons_are_proto_enums():
-    assert bot.FinishReason.STOP in bot.FINISH_OK
-    assert bot.FinishReason.MAX_TOKENS in bot.FINISH_OK
-    assert bot.FinishReason.SAFETY not in bot.FINISH_OK
+def test_empty_collection_refunds_its_own_request_and_keeps_context_notice(monkeypatch):
+    summary = install_summary(monkeypatch)
+    obj = interaction(user_id=99)
+
+    async def run():
+        await bot.check_summary_cooldown(obj)
+        await bot.check_summary_cooldown(interaction(user_id=99, interaction_id=2))
+        await bot.check_summary_cooldown(interaction(user_id=99, interaction_id=3))
+        await bot.respond_with_summary(obj, [], notice="기록 접근 불가. ")
+        await bot.check_summary_cooldown(interaction(user_id=99, interaction_id=4))
+        with pytest.raises(app_commands.CommandOnCooldown):
+            await bot.check_summary_cooldown(interaction(user_id=99, interaction_id=5))
+
+    asyncio.run(run())
+    summary.assert_not_awaited()
+    assert "기록 접근 불가" in obj.followup.send.await_args.args[0]
 
 
-def test_char_limit_drops_oldest_lines():
-    lines = ["aaaa", "bb", "c"]
-    assert bot.trim_oldest_to_char_limit(lines, 4) == ["bb", "c"]
+def test_actual_api_failure_is_charged_according_to_documented_policy(monkeypatch):
+    install_summary(monkeypatch, error=SummaryError("quota"))
+
+    async def run():
+        for i in range(3):
+            obj = interaction(user_id=99, interaction_id=i)
+            await bot.check_summary_cooldown(obj)
+            await bot.respond_with_summary(obj, ["사람: 내용"])
+            assert "사용량 제한" in obj.followup.send.await_args.args[0]
+        with pytest.raises(app_commands.CommandOnCooldown):
+            await bot.check_summary_cooldown(interaction(user_id=99, interaction_id=4))
+
+    asyncio.run(run())
 
 
-def test_char_limit_keeps_newest_even_if_it_exceeds():
-    assert bot.trim_oldest_to_char_limit(["old", "toolong"], 3) == ["toolong"]
+def test_char_truncation_discloses_dropped_input_and_accurate_analysis_count(monkeypatch):
+    monkeypatch.setattr(bot, "SETTINGS", replace(bot.SETTINGS, max_log_chars=10))
+    summary = install_summary(monkeypatch)
+    obj = interaction()
+    asyncio.run(
+        bot.respond_with_summary(
+            obj, ["오래된: 발언발언발언", "나: 안녕", "너: 안녕"], notice="수집 상한 안내.\n"
+        )
+    )
+    summary.assert_awaited_once_with("너: 안녕")
+    text = obj.followup.send.await_args.args[0]
+    assert "메시지 **1개** 분석" in text
+    assert "입력 문자 수 제한으로 오래된 메시지 2개" in text
+    assert "수집 상한 안내" in text
 
 
-def test_split_for_discord_omits_empty_chunks():
-    assert bot.split_for_discord("") == []
-    chunks = bot.split_for_discord(("a" * 2000) + "\n\n" + ("b" * 10))
-    assert chunks
-    assert all(chunk for chunk in chunks)
+def test_single_oversized_input_is_bounded_and_disclosed(monkeypatch):
+    monkeypatch.setattr(bot, "SETTINGS", replace(bot.SETTINGS, max_log_chars=10))
+    summary = install_summary(monkeypatch)
+    obj = interaction()
+    asyncio.run(bot.respond_with_summary(obj, ["나: " + "긴본문" * 20]))
+    assert len(summary.await_args.args[0]) == 10
+    text = obj.followup.send.await_args.args[0]
+    assert "본문 일부만 분석" in text
+    assert "메시지 **1개** 분석" in text
 
 
-async def _fake_history(limit=None, after=None, **_kwargs):
-    # id 0..9 메시지. after.id=N 이면 N+1부터 아래쪽만.
-    start = (after.id + 1) if after is not None else 0
-    end = 10 if limit is None else min(10, start + limit)
-    for i in range(start, end):
-        yield fake_message(f"user{i}", f"msg{i}", msg_id=i)
+def test_success_is_public_bounded_and_cannot_ping(monkeypatch):
+    install_summary(
+        monkeypatch,
+        result="@everyone <@123456789012345678> <@&123456789012345678> " + "한글🙂" * 10_000,
+    )
+    obj = interaction()
+    asyncio.run(bot.respond_with_summary(obj, ["나: 안녕"]))
+    assert obj.followup.send.await_count == 4
+    for call in obj.followup.send.await_args_list:
+        assert discord_length(call.args[0]) <= 2000
+        assert call.args[0].strip()
+        assert call.kwargs.get("ephemeral", False) is False
+        assert call.kwargs["allowed_mentions"].to_dict()["parse"] == []
+        assert "@everyone" not in call.args[0]
+        assert "<@123" not in call.args[0] and "<@&123" not in call.args[0]
+    assert "출력 길이 제한" in obj.followup.send.await_args.args[0]
 
 
-class FakeChannel:
-    def history(self, *, limit=None, after=None, **_kwargs):
-        return _fake_history(limit=limit, after=after)
+def test_first_chunk_send_failure_recovers_the_summary_in_original(monkeypatch):
+    install_summary(monkeypatch)
+    obj = interaction()
+    obj.followup.send.side_effect = http_error()
+    asyncio.run(bot.respond_with_summary(obj, ["alice: hi"]))
+    obj.edit_original_response.assert_awaited_once()
+    assert "요약 본문" in obj.edit_original_response.await_args.kwargs["content"]
+    assert obj.followup.send.await_count == 1
 
 
-def test_collect_recent_respects_limit():
-    collected = asyncio.run(bot.collect_recent(FakeChannel(), limit=10))
-    assert len(collected) == 10
+def test_partial_chunk_send_failure_annotates_last_delivered_chunk(monkeypatch):
+    install_summary(monkeypatch, result="가" * 3500)
+    obj = interaction()
+    last_message = SimpleNamespace(edit=AsyncMock())
+    obj.followup.send.side_effect = [last_message, http_error()]
+    asyncio.run(bot.respond_with_summary(obj, ["alice: hi"]))
+    assert obj.followup.send.await_count == 2
+    text = last_message.edit.await_args.kwargs["content"]
+    assert "일부만 전달" in text and "1/2개" in text
+    assert discord_length(text) <= 2000
+    assert "요약 중 문제가" not in text
+    obj.edit_original_response.assert_not_awaited()
 
 
-def test_collect_below_message_only_gets_start_and_following():
-    start = fake_message("anchor", "start here", msg_id=3)
-    start.channel = FakeChannel()
-    collected = asyncio.run(bot.collect_below_message(start, limit=10))
-    assert collected[0].startswith("anchor:")
-    assert len(collected) == 7
-    assert all("user0" not in line and "user1" not in line and "user2" not in line for line in collected)
+def test_first_chunk_fallback_then_later_failure_edits_original_status(monkeypatch):
+    install_summary(monkeypatch, result="가" * 3500)
+    obj = interaction()
+    obj.followup.send.side_effect = http_error()
+    asyncio.run(bot.respond_with_summary(obj, ["alice: hi"]))
+    assert obj.edit_original_response.await_count == 2
+    assert "1/2개" in obj.edit_original_response.await_args.kwargs["content"]
 
 
-def test_collect_below_message_stops_at_available_not_channel_tail():
-    """아래에 7개뿐이면 7개만. limit=300이어도 채널 끝 300개를 가져오지 않는다."""
-    start = fake_message("anchor", "start", msg_id=3)
-    start.channel = FakeChannel()
-    collected = asyncio.run(bot.collect_below_message(start, limit=300))
-    assert len(collected) == 7
+def test_failed_partial_annotation_uses_ephemeral_status(monkeypatch):
+    install_summary(monkeypatch, result="가" * 3500)
+    obj = interaction()
+    last_message = SimpleNamespace(edit=AsyncMock(side_effect=http_error()))
+    obj.followup.send.side_effect = [last_message, http_error(), None]
+    asyncio.run(bot.respond_with_summary(obj, ["alice: hi"]))
+    assert obj.followup.send.await_args.kwargs["ephemeral"] is True
+    assert "1/2개" in obj.followup.send.await_args.args[0]
+
+
+def test_all_partial_recoveries_fail_with_diagnostic_counts(monkeypatch, caplog):
+    install_summary(monkeypatch, result="가" * 3500)
+    obj = interaction(interaction_id=333)
+    last_message = SimpleNamespace(edit=AsyncMock(side_effect=http_error()))
+    obj.followup.send.side_effect = [last_message, http_error(), http_error()]
+    asyncio.run(bot.respond_with_summary(obj, ["비공개 원문"]))
+    assert "summary_partial_undelivered interaction=333 sent=1 total=2" in caplog.text
+    assert "secret-placeholder" not in caplog.text and "비공개 원문" not in caplog.text
+
+
+def test_all_first_chunk_deliveries_fail_without_misreporting_ai_failure(monkeypatch, caplog):
+    install_summary(monkeypatch)
+    obj = interaction()
+    obj.followup.send.side_effect = http_error()
+    obj.edit_original_response.side_effect = http_error()
+    asyncio.run(bot.respond_with_summary(obj, ["alice: hi"]))
+    sent = [call.args[0] for call in obj.followup.send.await_args_list]
+    assert not any("요약 중 문제가 발생했어요" in text for text in sent)
+    assert any("요약은 생성했지만 전송하지 못" in text for text in sent)
+    assert "reply_undelivered" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "kind,phrase",
+    [
+        ("authentication", "인증"),
+        ("permission", "권한"),
+        ("quota", "사용량"),
+        ("timeout", "오래"),
+        ("blocked", "안전 정책"),
+        ("empty", "빈 응답"),
+    ],
+)
+def test_error_categories_have_distinct_korean_guidance(monkeypatch, kind, phrase):
+    install_summary(monkeypatch, error=SummaryError(kind))
+    obj = interaction()
+    asyncio.run(bot.respond_with_summary(obj, ["나: 안녕"]))
+    assert phrase in obj.followup.send.await_args.args[0]
+
+
+def test_unexpected_summary_error_is_logged_without_raw_data(monkeypatch, caplog):
+    install_summary(monkeypatch, error=RuntimeError("secret-placeholder"))
+    obj = interaction()
+    asyncio.run(bot.respond_with_summary(obj, ["민감한 원문"]))
+    assert "summary_unexpected_failure" in caplog.text
+    assert "secret-placeholder" not in caplog.text and "민감한 원문" not in caplog.text
+
+
+def test_command_collects_300_beyond_default_100_without_false_overflow(monkeypatch):
+    summary = install_summary(monkeypatch)
+    messages = [fake_message(content=f"본문{i}", msg_id=i) for i in range(300)]
+    messages[0].channel = FakeChannel(messages)
+    obj = interaction()
+    asyncio.run(bot.summarize_from_message.callback(obj, messages[0]))
+    assert len(summary.await_args.args[0].splitlines()) == 300
+    text = obj.followup.send.await_args.args[0]
+    assert "메시지 **300개** 분석" in text
+    assert "추가 요약 대상" not in text
+    obj.response.defer.assert_awaited_once_with(thinking=True)
+
+
+def test_command_discloses_confirmed_message_overflow(monkeypatch):
+    install_summary(monkeypatch)
+    messages = [fake_message(msg_id=i) for i in range(301)]
+    messages[0].channel = FakeChannel(messages)
+    obj = interaction()
+    asyncio.run(bot.summarize_from_message.callback(obj, messages[0]))
+    assert "추가 요약 대상 메시지가 있어" in obj.followup.send.await_args.args[0]
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_user_install_without_history_access_only_summarizes_selected_message(monkeypatch, status):
+    summary = install_summary(monkeypatch)
+    message = fake_message("선택화자", "선택본문")
+    message.channel = FakeChannel(error=http_error(status))
+    obj = interaction()
+    asyncio.run(bot.summarize_from_message.callback(obj, message))
+    summary.assert_awaited_once_with("선택화자: 선택본문")
+    assert "채널 기록에 접근할 수 없어 선택한 메시지만" in obj.followup.send.await_args.args[0]
+
+
+def test_fallback_still_filters_bot_messages_and_refunds_empty_input(monkeypatch):
+    summary = install_summary(monkeypatch)
+    message = fake_message(bot=True)
+    message.channel = FakeChannel(error=http_error(403))
+    obj = interaction()
+
+    async def run():
+        await bot.check_summary_cooldown(obj)
+        await bot.summarize_from_message.callback(obj, message)
+        assert bot.summary_limiter.bucket_count == 0
+
+    asyncio.run(run())
+    summary.assert_not_awaited()
+    assert "선택한 메시지만" in obj.followup.send.await_args.args[0]
+    assert "요약할 대화를 찾지 못" in obj.followup.send.await_args.args[0]
+
+
+def test_temporary_history_http_error_does_not_silently_fallback_and_refunds(monkeypatch):
+    summary = install_summary(monkeypatch)
+    message = fake_message()
+    message.channel = FakeChannel(error=http_error(503))
+    obj = interaction()
+
+    async def run():
+        await bot.check_summary_cooldown(obj)
+        with pytest.raises(discord.HTTPException):
+            await bot.summarize_from_message.callback(obj, message)
+        assert bot.summary_limiter.bucket_count == 0
+
+    asyncio.run(run())
+    summary.assert_not_awaited()
+
+
+def test_cancelled_collection_refunds_and_propagates_cancellation(monkeypatch):
+    message = fake_message()
+    message.channel = FakeChannel([fake_message(msg_id=1)], delay=10)
+    obj = interaction()
+
+    async def run():
+        await bot.check_summary_cooldown(obj)
+        task = asyncio.create_task(bot.summarize_from_message.callback(obj, message))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert bot.summary_limiter.bucket_count == 0
+
+    asyncio.run(run())
+
+
+def test_cancelled_generation_propagates_without_refund(monkeypatch):
+    install_summary(monkeypatch, error=asyncio.CancelledError())
+    monkeypatch.setattr(
+        bot,
+        "collect_below_message",
+        AsyncMock(return_value=CollectionResult(messages=["사람: 내용"])),
+    )
+    obj = interaction()
+
+    async def run():
+        await bot.check_summary_cooldown(obj)
+        with pytest.raises(asyncio.CancelledError):
+            await bot.summarize_from_message.callback(obj, fake_message())
+        assert bot.summary_limiter.bucket_count == 1
+
+    asyncio.run(run())
+    obj.followup.send.assert_not_awaited()
+
+
+def test_setup_hook_survives_sync_oserror_without_calling_gemini(monkeypatch):
+    monkeypatch.setattr(bot.tree, "sync", AsyncMock(side_effect=OSError("dns")))
+    monkeypatch.setattr(bot.bot, "summarizer", None)
+    asyncio.run(bot.setup_hook())
+    assert bot.bot.summarizer is not None
+
+
+def test_bot_shutdown_closes_summarizer():
+    client = bot.SummaryBot(intents=discord.Intents.none())
+    summarizer = SimpleNamespace(aclose=AsyncMock())
+    client.summarizer = summarizer
+    asyncio.run(client.close())
+    summarizer.aclose.assert_awaited_once()
+    assert client.summarizer is None
